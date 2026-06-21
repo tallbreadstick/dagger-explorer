@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipboardOp {
@@ -6,7 +6,11 @@ pub enum ClipboardOp {
     Move,
 }
 
-/// Copy real filesystem paths to the OS clipboard the way desktop file managers do.
+const MIME_URI_LIST: &str = "text/uri-list";
+const MIME_GNOME: &str = "x-special/gnome-copied-files";
+const MIME_KDE_CUT: &str = "application/x-kde-cutselection";
+
+/// Copy real filesystem paths to the OS clipboard the way Qt/KDE file managers do.
 pub fn set_system_clipboard(paths: Vec<PathBuf>, op: ClipboardOp) -> Result<(), String> {
     if paths.is_empty() {
         return Err("No paths to place on clipboard".into());
@@ -29,7 +33,7 @@ pub fn set_system_clipboard(paths: Vec<PathBuf>, op: ClipboardOp) -> Result<(), 
     }
 }
 
-/// Read file paths and operation from the OS clipboard.
+/// Read file paths and copy/move intent from the OS clipboard.
 pub fn get_system_clipboard() -> Result<(Vec<PathBuf>, ClipboardOp), String> {
     #[cfg(windows)]
     {
@@ -44,6 +48,147 @@ pub fn get_system_clipboard() -> Result<(Vec<PathBuf>, ClipboardOp), String> {
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         Err("OS clipboard is not supported on this platform".into())
+    }
+}
+
+/// Whether the OS clipboard currently contains file URLs (cheap check for UI enablement).
+pub fn has_file_clipboard() -> bool {
+    #[cfg(windows)]
+    {
+        return windows::has_file_clipboard();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return linux::has_file_clipboard();
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
+struct FileClipboardPayload {
+    uri_list: Vec<u8>,
+    gnome: Vec<u8>,
+    kde_cut: Option<Vec<u8>>,
+}
+
+fn build_payload(paths: &[PathBuf], op: ClipboardOp) -> Result<FileClipboardPayload, String> {
+    let uris: Vec<String> = paths
+        .iter()
+        .map(|path| path_to_file_uri(path))
+        .collect::<Result<_, _>>()?;
+    let uri_list = uris.join("\r\n");
+    let action = match op {
+        ClipboardOp::Copy => "copy",
+        ClipboardOp::Move => "cut",
+    };
+    let gnome = format!("{action}\r\n{}\r\n", uris.join("\r\n"));
+    let kde_cut = match op {
+        ClipboardOp::Move => Some(vec![b'1']),
+        ClipboardOp::Copy => None,
+    };
+
+    Ok(FileClipboardPayload {
+        uri_list: uri_list.into_bytes(),
+        gnome: gnome.into_bytes(),
+        kde_cut,
+    })
+}
+
+fn path_to_file_uri(path: &Path) -> Result<String, String> {
+    let abs = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve {}: {error}", path.display()))?;
+    let encoded = percent_encode(abs.display().to_string().as_bytes());
+    Ok(format!("file://{encoded}"))
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_digit(byte >> 4));
+                out.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'A' + (value - 10)) as char,
+    }
+}
+
+fn parse_uri_list(data: &str) -> Vec<PathBuf> {
+    data.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(parse_uri_line)
+        .collect()
+}
+
+fn parse_uri_line(line: &str) -> Option<PathBuf> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("file://") {
+        return Some(PathBuf::from(percent_decode(trimmed.strip_prefix("file://")?)));
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(value as char);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
+fn parse_gnome(data: &str) -> Option<(ClipboardOp, Vec<PathBuf>)> {
+    let mut lines = data.lines();
+    let op = match lines.next()?.trim() {
+        "cut" => ClipboardOp::Move,
+        _ => ClipboardOp::Copy,
+    };
+    let paths = lines.filter_map(parse_uri_line).collect::<Vec<_>>();
+    if paths.is_empty() {
+        None
+    } else {
+        Some((op, paths))
+    }
+}
+
+fn parse_kde_cut(data: &[u8]) -> ClipboardOp {
+    if data.first() == Some(&b'1') {
+        ClipboardOp::Move
+    } else {
+        ClipboardOp::Copy
     }
 }
 
@@ -85,14 +230,18 @@ mod windows {
         unsafe { get_system_clipboard_inner() }
     }
 
+    pub fn has_file_clipboard() -> bool {
+        unsafe {
+            OpenClipboard(None).is_ok()
+                && IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok()
+                && CloseClipboard().is_ok()
+        }
+    }
+
     unsafe fn set_system_clipboard_inner(
         paths: Vec<String>,
         op: ClipboardOp,
     ) -> Result<(), String> {
-        if paths.is_empty() {
-            return Err("No valid paths provided".into());
-        }
-
         let canonical: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
 
         let mut wide_units: Vec<u16> = Vec::new();
@@ -188,7 +337,7 @@ mod windows {
             let hdrop = HDROP(handle.0);
             let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
             for i in 0..count {
-                let mut buffer = vec![0u16; 260];
+                let mut buffer = vec![0u16; 1024];
                 let len = DragQueryFileW(hdrop, i, Some(&mut buffer));
                 let s = OsString::from_wide(&buffer[..len as usize]);
                 file_list.push(PathBuf::from(s));
@@ -211,162 +360,253 @@ mod windows {
         }
 
         CloseClipboard().map_err(|e| format!("CloseClipboard failed: {e}"))?;
+
+        if file_list.is_empty() {
+            return Err("Clipboard does not contain file paths".into());
+        }
+
         Ok((file_list, op))
     }
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::path::PathBuf;
 
-    use super::ClipboardOp;
+    use super::{
+        build_payload, parse_gnome, parse_kde_cut, parse_uri_list, ClipboardOp,
+    };
 
     pub fn set_system_clipboard(paths: Vec<PathBuf>, op: ClipboardOp) -> Result<(), String> {
-        let uris: Vec<String> = paths.iter().map(|path| path_to_uri(path)).collect();
-        let uri_list = uris.join("\n");
-        let action = match op {
-            ClipboardOp::Copy => "copy",
-            ClipboardOp::Move => "cut",
-        };
-        let gnome = format!("{action}\n{}\n", uris.join("\n"));
-
-        copy_to_clipboard("text/uri-list", &uri_list)?;
-        copy_to_clipboard("x-special/gnome-copied-files", &gnome)?;
-        Ok(())
+        let payload = build_payload(&paths, op)?;
+        if is_wayland() {
+            wayland::set(&payload).or_else(|wayland_error| {
+                x11::set(&payload).map_err(|x11_error| {
+                    format!("Wayland clipboard failed ({wayland_error}); X11 fallback failed ({x11_error})")
+                })
+            })
+        } else {
+            x11::set(&payload)
+        }
     }
 
     pub fn get_system_clipboard() -> Result<(Vec<PathBuf>, ClipboardOp), String> {
-        if let Ok(gnome) = paste_from_clipboard("x-special/gnome-copied-files") {
-            let mut lines = gnome.lines();
-            let op = match lines.next().unwrap_or("copy") {
-                "cut" => ClipboardOp::Move,
-                _ => ClipboardOp::Copy,
-            };
-            let paths = lines.filter_map(parse_uri_line).collect::<Vec<_>>();
-            if !paths.is_empty() {
-                return Ok((paths, op));
-            }
-        }
-
-        let uri_list = paste_from_clipboard("text/uri-list")?;
-        let paths = uri_list
-            .lines()
-            .filter_map(parse_uri_line)
-            .collect::<Vec<_>>();
-        if paths.is_empty() {
-            return Err("Clipboard does not contain file paths".into());
-        }
-        Ok((paths, ClipboardOp::Copy))
-    }
-
-    fn path_to_uri(path: &Path) -> String {
-        let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let encoded = abs
-            .display()
-            .to_string()
-            .chars()
-            .map(|ch| match ch {
-                ' ' => "%20".to_string(),
-                '%' => "%25".to_string(),
-                '#' => "%23".to_string(),
-                '?' => "%3F".to_string(),
-                _ if ch.is_ascii() => ch.to_string(),
-                _ => ch.to_string(),
-            })
-            .collect::<String>();
-        format!("file://{encoded}")
-    }
-
-    fn parse_uri_line(line: &str) -> Option<PathBuf> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let path = trimmed.strip_prefix("file://")?;
-        Some(PathBuf::from(percent_decode(path)))
-    }
-
-    fn percent_decode(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let bytes = input.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' && index + 2 < bytes.len() {
-                if let Ok(value) = u8::from_str_radix(
-                    std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
-                    16,
-                ) {
-                    out.push(value as char);
-                    index += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[index] as char);
-            index += 1;
-        }
-        out
-    }
-
-    fn copy_to_clipboard(mime: &str, data: &str) -> Result<(), String> {
-        if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            let mut child = Command::new("wl-copy")
-                .arg("-t")
-                .arg(mime)
-                .stdin(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("wl-copy failed to start: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(data.as_bytes())
-                    .map_err(|e| format!("wl-copy write failed: {e}"))?;
-            }
-            let status = child
-                .wait()
-                .map_err(|e| format!("wl-copy wait failed: {e}"))?;
-            if status.success() {
-                return Ok(());
-            }
-        }
-
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard", "-t", mime, "-i"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("xclip failed to start: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(data.as_bytes())
-                .map_err(|e| format!("xclip write failed: {e}"))?;
-        }
-        let status = child
-            .wait()
-            .map_err(|e| format!("xclip wait failed: {e}"))?;
-        if status.success() {
-            Ok(())
+        if is_wayland() {
+            wayland::get().or_else(|_| x11::get())
         } else {
-            Err("Failed to write to clipboard".into())
+            x11::get()
         }
     }
 
-    fn paste_from_clipboard(mime: &str) -> Result<String, String> {
-        if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            if let Ok(output) = Command::new("wl-paste").arg("-t").arg(mime).output() {
-                if output.status.success() {
-                    return String::from_utf8(output.stdout)
-                        .map_err(|e| format!("Invalid UTF-8 from wl-paste: {e}"));
-                }
+    pub fn has_file_clipboard() -> bool {
+        if is_wayland() {
+            wayland::has_files().unwrap_or(false) || x11::has_files().unwrap_or(false)
+        } else {
+            x11::has_files().unwrap_or(false)
+        }
+    }
+
+    fn is_wayland() -> bool {
+        std::env::var("WAYLAND_DISPLAY").is_ok()
+    }
+
+    mod wayland {
+        use std::io::Read;
+        use std::path::PathBuf;
+
+        use wl_clipboard_rs::copy::{MimeSource, MimeType, Options, Source};
+        use wl_clipboard_rs::paste::{
+            get_contents, get_mime_types, ClipboardType, Error as PasteError, MimeType as PasteMime,
+            Seat,
+        };
+
+        use super::super::{FileClipboardPayload, MIME_GNOME, MIME_KDE_CUT, MIME_URI_LIST};
+        use super::{parse_gnome, parse_kde_cut, parse_uri_list, ClipboardOp};
+
+        pub fn set(payload: &FileClipboardPayload) -> Result<(), String> {
+            let mut sources = vec![
+                MimeSource {
+                    source: Source::Bytes(payload.uri_list.clone().into()),
+                    mime_type: MimeType::Specific(MIME_URI_LIST.into()),
+                },
+                MimeSource {
+                    source: Source::Bytes(payload.gnome.clone().into()),
+                    mime_type: MimeType::Specific(MIME_GNOME.into()),
+                },
+            ];
+            if let Some(kde_cut) = &payload.kde_cut {
+                sources.push(MimeSource {
+                    source: Source::Bytes(kde_cut.clone().into()),
+                    mime_type: MimeType::Specific(MIME_KDE_CUT.into()),
+                });
             }
+
+            Options::new()
+                .copy_multi(sources)
+                .map_err(|error| format!("Wayland clipboard write failed: {error}"))
         }
 
-        let output = Command::new("xclip")
-            .args(["-selection", "clipboard", "-t", mime, "-o"])
-            .output()
-            .map_err(|e| format!("xclip read failed: {e}"))?;
-        if !output.status.success() {
-            return Err("Failed to read from clipboard".into());
+        pub fn get() -> Result<(Vec<PathBuf>, ClipboardOp), String> {
+            if let Ok(data) = read_mime(MIME_GNOME) {
+                if let Ok(text) = String::from_utf8(data) {
+                    if let Some((op, paths)) = parse_gnome(&text) {
+                        return Ok((paths, op));
+                    }
+                }
+            }
+
+            let uri_data = read_mime(MIME_URI_LIST)?;
+            let uri_text = String::from_utf8(uri_data)
+                .map_err(|error| format!("Invalid UTF-8 in text/uri-list: {error}"))?;
+            let paths = parse_uri_list(&uri_text);
+            if paths.is_empty() {
+                return Err("Clipboard does not contain file paths".into());
+            }
+
+            let op = read_mime(MIME_KDE_CUT)
+                .map(|data| parse_kde_cut(&data))
+                .unwrap_or(ClipboardOp::Copy);
+
+            Ok((paths, op))
         }
-        String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8 from xclip: {e}"))
+
+        pub fn has_files() -> Result<bool, String> {
+            let types = get_mime_types(ClipboardType::Regular, Seat::Unspecified)
+                .map_err(|error| format!("Wayland clipboard query failed: {error}"))?;
+            Ok(types.contains(MIME_URI_LIST)
+                || types.contains(MIME_GNOME)
+                || types.contains(MIME_KDE_CUT))
+        }
+
+        fn read_mime(mime: &str) -> Result<Vec<u8>, String> {
+            let (mut pipe, _) =
+                get_contents(ClipboardType::Regular, Seat::Unspecified, PasteMime::Specific(mime))
+                    .map_err(map_paste_error)?;
+            let mut data = Vec::new();
+            pipe.read_to_end(&mut data)
+                .map_err(|error| format!("Wayland clipboard read failed: {error}"))?;
+            Ok(data)
+        }
+
+        fn map_paste_error(error: PasteError) -> String {
+            match error {
+                PasteError::ClipboardEmpty | PasteError::NoMimeType | PasteError::NoSeats => {
+                    "Clipboard does not contain file paths".into()
+                }
+                other => format!("Wayland clipboard read failed: {other}"),
+            }
+        }
+    }
+
+    mod x11 {
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        use x11_clipboard::Clipboard;
+        use x11rb::protocol::xproto::ConnectionExt;
+
+        use super::super::{FileClipboardPayload, MIME_GNOME, MIME_KDE_CUT, MIME_URI_LIST};
+        use super::{parse_gnome, parse_kde_cut, parse_uri_list, ClipboardOp};
+
+        pub fn set(payload: &FileClipboardPayload) -> Result<(), String> {
+            let clipboard =
+                Clipboard::new().map_err(|error| format!("X11 clipboard unavailable: {error}"))?;
+            let selection = clipboard.getter.atoms.clipboard;
+            let uri_atom = intern_atom(&clipboard, MIME_URI_LIST)?;
+            let gnome_atom = intern_atom(&clipboard, MIME_GNOME)?;
+
+            clipboard
+                .store(selection, uri_atom, payload.uri_list.clone())
+                .map_err(|error| format!("X11 clipboard write failed for uri-list: {error}"))?;
+            clipboard
+                .store(selection, gnome_atom, payload.gnome.clone())
+                .map_err(|error| format!("X11 clipboard write failed for gnome format: {error}"))?;
+
+            if let Some(kde_cut) = &payload.kde_cut {
+                let kde_atom = intern_atom(&clipboard, MIME_KDE_CUT)?;
+                clipboard.store(selection, kde_atom, kde_cut.clone()).map_err(|error| {
+                    format!("X11 clipboard write failed for KDE cut marker: {error}")
+                })?;
+            }
+
+            Ok(())
+        }
+
+        pub fn get() -> Result<(Vec<PathBuf>, ClipboardOp), String> {
+            let clipboard =
+                Clipboard::new().map_err(|error| format!("X11 clipboard unavailable: {error}"))?;
+            let selection = clipboard.getter.atoms.clipboard;
+            let property = clipboard.getter.atoms.property;
+            let timeout = Duration::from_millis(100);
+
+            if let Ok(data) = clipboard.load(
+                selection,
+                intern_atom(&clipboard, MIME_GNOME)?,
+                property,
+                timeout,
+            ) {
+                if let Ok(text) = String::from_utf8(data) {
+                    if let Some((op, paths)) = parse_gnome(&text) {
+                        return Ok((paths, op));
+                    }
+                }
+            }
+
+            let uri_data = clipboard
+                .load(
+                    selection,
+                    intern_atom(&clipboard, MIME_URI_LIST)?,
+                    property,
+                    timeout,
+                )
+                .map_err(|error| format!("X11 clipboard read failed: {error}"))?;
+            let uri_text = String::from_utf8(uri_data)
+                .map_err(|error| format!("Invalid UTF-8 in text/uri-list: {error}"))?;
+            let paths = parse_uri_list(&uri_text);
+            if paths.is_empty() {
+                return Err("Clipboard does not contain file paths".into());
+            }
+
+            let op = clipboard
+                .load(
+                    selection,
+                    intern_atom(&clipboard, MIME_KDE_CUT)?,
+                    property,
+                    timeout,
+                )
+                .map(|data| parse_kde_cut(&data))
+                .unwrap_or(ClipboardOp::Copy);
+
+            Ok((paths, op))
+        }
+
+        pub fn has_files() -> Result<bool, String> {
+            let clipboard =
+                Clipboard::new().map_err(|error| format!("X11 clipboard unavailable: {error}"))?;
+            let selection = clipboard.getter.atoms.clipboard;
+            let property = clipboard.getter.atoms.property;
+            let timeout = Duration::from_millis(50);
+
+            for mime in [MIME_URI_LIST, MIME_GNOME] {
+                if intern_atom(&clipboard, mime)
+                    .ok()
+                    .is_some_and(|atom| clipboard.load(selection, atom, property, timeout).is_ok())
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn intern_atom(clipboard: &Clipboard, name: &str) -> Result<x11_clipboard::Atom, String> {
+            clipboard
+                .getter
+                .connection
+                .intern_atom(false, name.as_bytes())
+                .map_err(|error| format!("Failed to intern atom {name}: {error}"))?
+                .reply()
+                .map(|reply| reply.atom)
+                .map_err(|error| format!("Failed to intern atom {name}: {error}"))
+        }
     }
 }

@@ -5,7 +5,7 @@ use super::paths::home_dir;
 use super::tab::ExplorerTab;
 use super::transfer::{TransferManager, TransferMode};
 use super::view::FileViewOptions;
-use super::{get_system_clipboard, set_system_clipboard, ClipboardOp, ClipboardMode};
+use super::{get_system_clipboard, has_file_clipboard, set_system_clipboard, ClipboardOp, ClipboardMode};
 
 #[derive(Debug)]
 pub struct TreeNode {
@@ -68,6 +68,8 @@ pub struct ExplorerState {
     pub selection_marquee: Option<SelectionMarquee>,
     pub file_view_bounds: Option<egui::Rect>,
     pub transfer: TransferManager,
+    clipboard_paste_available: bool,
+    last_clipboard_check: f64,
 }
 
 impl ExplorerState {
@@ -84,6 +86,8 @@ impl ExplorerState {
             selection_marquee: None,
             file_view_bounds: None,
             transfer: TransferManager::new(),
+            clipboard_paste_available: false,
+            last_clipboard_check: 0.0,
         };
         state.fs_cache.request_listing(home);
         state
@@ -109,6 +113,23 @@ impl ExplorerState {
             self.apply_transfer_invalidation();
             ctx.request_repaint();
         }
+        self.refresh_clipboard_state(ctx);
+    }
+
+    pub fn refresh_clipboard_state(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        if now - self.last_clipboard_check < 0.5 {
+            return;
+        }
+        self.last_clipboard_check = now;
+        self.clipboard_paste_available =
+            self.view_options.clipboard.is_some() || has_file_clipboard();
+    }
+
+    fn refresh_clipboard_state_now(&mut self) {
+        self.clipboard_paste_available =
+            self.view_options.clipboard.is_some() || has_file_clipboard();
+        self.last_clipboard_check = f64::MAX;
     }
 
     fn apply_transfer_invalidation(&mut self) {
@@ -127,7 +148,7 @@ impl ExplorerState {
     }
 
     pub fn can_paste(&self) -> bool {
-        self.view_options.clipboard.is_some()
+        self.clipboard_paste_available
     }
 
     pub fn cut_selection(&mut self) {
@@ -135,9 +156,9 @@ impl ExplorerState {
             return;
         }
         let paths = self.view_options.selected.clone();
-        let op = ClipboardOp::Move;
-        if set_system_clipboard(paths.clone(), op).is_ok() {
+        if set_system_clipboard(paths.clone(), ClipboardOp::Move).is_ok() {
             self.view_options.clipboard = Some((ClipboardMode::Cut, paths));
+            self.refresh_clipboard_state_now();
         }
     }
 
@@ -146,9 +167,9 @@ impl ExplorerState {
             return;
         }
         let paths = self.view_options.selected.clone();
-        let op = ClipboardOp::Copy;
-        if set_system_clipboard(paths.clone(), op).is_ok() {
+        if set_system_clipboard(paths.clone(), ClipboardOp::Copy).is_ok() {
             self.view_options.clipboard = Some((ClipboardMode::Copy, paths));
+            self.refresh_clipboard_state_now();
         }
     }
 
@@ -157,31 +178,58 @@ impl ExplorerState {
             return;
         }
 
-        let (paths, mode) = if let Some((clip_mode, paths)) = &self.view_options.clipboard {
-            (
-                paths.clone(),
-                match clip_mode {
-                    ClipboardMode::Copy => TransferMode::Copy,
-                    ClipboardMode::Cut => TransferMode::Move,
-                },
-            )
-        } else if let Ok((paths, op)) = get_system_clipboard() {
-            if paths.is_empty() {
-                return;
-            }
-            (
+        let (paths, mode) = match get_system_clipboard() {
+            Ok((paths, op)) if !paths.is_empty() => (
                 paths,
                 match op {
                     ClipboardOp::Copy => TransferMode::Copy,
                     ClipboardOp::Move => TransferMode::Move,
                 },
-            )
-        } else {
-            return;
+            ),
+            _ => {
+                let Some((clip_mode, paths)) = self.view_options.clipboard.clone() else {
+                    return;
+                };
+                if paths.is_empty() {
+                    return;
+                }
+                (
+                    paths,
+                    match clip_mode {
+                        ClipboardMode::Copy => TransferMode::Copy,
+                        ClipboardMode::Cut => TransferMode::Move,
+                    },
+                )
+            }
         };
 
         let dest = self.active_path();
         self.transfer.start(paths, dest, mode);
+    }
+
+    pub fn handle_clipboard_shortcuts(&mut self, ui: &egui::Ui) {
+        let pressed = ui.input(|input| {
+            let mods = input.modifiers;
+            if !(mods.command || mods.ctrl) {
+                return None;
+            }
+            if input.key_pressed(egui::Key::C) {
+                Some("copy")
+            } else if input.key_pressed(egui::Key::X) {
+                Some("cut")
+            } else if input.key_pressed(egui::Key::V) {
+                Some("paste")
+            } else {
+                None
+            }
+        });
+
+        match pressed {
+            Some("copy") => self.copy_selection(),
+            Some("cut") => self.cut_selection(),
+            Some("paste") if self.can_paste() => self.paste_clipboard(),
+            _ => {}
+        }
     }
 
     pub fn ensure_listing(&mut self, path: PathBuf) {

@@ -251,6 +251,7 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                 }
 
                 handle_rename_input(ui, state);
+                state.handle_clipboard_shortcuts(ui);
             });
     });
 }
