@@ -1,0 +1,22 @@
+[package]
+name = "dagger-explorer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+eframe = "0.34.3"
+egui = "0.34.3"
+jwalk = "0.8.1"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+] }
+windows-core = "0.61"
