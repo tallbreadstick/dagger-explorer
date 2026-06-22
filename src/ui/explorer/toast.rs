@@ -96,7 +96,7 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                     }
 
                     let action = if transfer.progress.counting {
-                        "Counting total size…".to_string()
+                        "Calculating Size".to_string()
                     } else if transfer.progress.operation.is_empty() {
                         "Transferring".to_string()
                     } else {
@@ -107,30 +107,32 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                             .size(12.0)
                             .color(theme::text_primary()),
                     );
+                    if !transfer.progress.label.is_empty() {
+                        ui.label(
+                            egui::RichText::new(transfer.progress.label.clone())
+                                .size(10.0)
+                                .color(theme::text_muted()),
+                        );
+                    }
 
                     let progress = &transfer.progress;
-                    let file_fraction = if progress.total_files > 0 {
-                        progress.done_files as f32 / progress.total_files as f32
+                    let denominator = progress.total_bytes.max(progress.done_bytes).max(1);
+                    let byte_fraction = if denominator > 0 {
+                        progress.done_bytes as f32 / denominator as f32
                     } else {
                         0.0
                     };
-                    let byte_fraction = if progress.total_bytes > 0 {
-                        progress.done_bytes as f32 / progress.total_bytes as f32
-                    } else {
-                        file_fraction
-                    };
-                    let fraction = file_fraction.max(byte_fraction).clamp(0.0, 1.0);
+                    let fraction = byte_fraction.clamp(0.0, 1.0);
 
                     let bar_width = width - 24.0;
                     let bar_height = 4.0;
                     let (bar_rect, _) =
                         ui.allocate_exact_size(vec2(bar_width, bar_height), egui::Sense::hover());
                     ui.painter().rect_filled(bar_rect, 2.0, theme::glass_stroke());
-                    let show_indeterminate =
-                        transfer.progress.active && (transfer.progress.counting || fraction <= 0.0);
+                    let show_indeterminate = transfer.progress.active && transfer.progress.counting;
                     if show_indeterminate {
                         paint_indeterminate_bar(ui, bar_rect);
-                    } else if fraction > 0.0 {
+                    } else {
                         let fill_rect = egui::Rect::from_min_size(
                             bar_rect.min,
                             vec2(bar_rect.width() * fraction, bar_rect.height()),
@@ -147,11 +149,10 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                                 .color(theme::text_muted()),
                         );
                     } else {
+                        let done_kb = format_kb_grouped(progress.done_bytes);
+                        let total_kb = format_kb_grouped(progress.total_bytes);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{} / {} files",
-                                progress.done_files, progress.total_files
-                            ))
+                            egui::RichText::new(format!("{done_kb} / {total_kb} KB"))
                             .size(10.0)
                             .color(theme::text_muted()),
                         );
@@ -174,6 +175,19 @@ fn paint_indeterminate_bar(ui: &mut egui::Ui, rect: egui::Rect) {
         ui.painter().rect_filled(segment, 2.0, theme::selection_fill());
     }
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+}
+
+fn format_kb_grouped(bytes: u64) -> String {
+    let kb = if bytes == 0 { 0 } else { bytes.div_ceil(1024) };
+    let digits = kb.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {

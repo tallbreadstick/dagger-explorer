@@ -1,8 +1,9 @@
 use std::collections::HashSet;
+use std::fs;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,14 +56,19 @@ enum TransferEvent {
         done_bytes: u64,
         current: String,
     },
+    Conflict {
+        source: PathBuf,
+        destination: PathBuf,
+        reply: Sender<ConflictChoice>,
+    },
     Done {
         invalidate: Vec<PathBuf>,
     },
     Error(String),
 }
 
-const KIO_COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
-const KIO_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(120);
+const COPY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct TransferManager {
     event_rx: Option<Receiver<TransferEvent>>,
@@ -107,7 +113,10 @@ impl TransferManager {
         }
 
         let (event_tx, event_rx) = mpsc::channel();
-        self.conflict_state = None;
+        let apply_to_all = Arc::new(Mutex::new(None));
+        self.conflict_state = Some(ConflictState {
+            apply_to_all: Arc::clone(&apply_to_all),
+        });
         self.apply_to_all = false;
         self.pending_conflict = None;
         self.event_rx = Some(event_rx);
@@ -120,7 +129,7 @@ impl TransferManager {
             active: true,
             counting: true,
             operation,
-            label: "Starting transfer…".to_string(),
+            label: "Phase 1/2: Calculating total size…".to_string(),
             total_files: 0,
             done_files: 0,
             total_bytes: 0,
@@ -128,18 +137,16 @@ impl TransferManager {
             error: None,
         };
 
-        let count_sources = sources.clone();
-        let count_tx = event_tx.clone();
         thread::spawn(move || {
-            let (total_files, total_bytes) = count_transfer(count_sources.as_slice());
-            let _ = count_tx.send(TransferEvent::Totals {
+            // Process 1: traverse all staged inputs and only calculate totals.
+            let (total_files, total_bytes) = count_transfer(sources.as_slice());
+            let _ = event_tx.send(TransferEvent::Totals {
                 total_files,
                 total_bytes,
             });
-        });
 
-        thread::spawn(move || {
-            let result = run_transfer(sources, dest_dir, mode, &event_tx);
+            // Process 2: perform the actual transfer using the precalculated totals.
+            let result = run_transfer(sources, dest_dir, mode, &event_tx, apply_to_all);
             if let Err(message) = result {
                 let _ = event_tx.send(TransferEvent::Error(message));
             }
@@ -163,12 +170,10 @@ impl TransferManager {
                     total_files,
                     total_bytes,
                 } => {
-                    if total_files > 0 {
-                        self.progress.total_files = total_files;
-                    }
-                    if total_bytes > 0 {
-                        self.progress.total_bytes = total_bytes;
-                    }
+                    self.progress.total_files = total_files;
+                    self.progress.total_bytes = total_bytes;
+                    self.progress.counting = false;
+                    self.progress.label = "Phase 2/2: Starting transfer…".to_string();
                 }
                 TransferEvent::Progress {
                     done_files,
@@ -178,7 +183,29 @@ impl TransferManager {
                     self.progress.counting = false;
                     self.progress.done_files = done_files;
                     self.progress.done_bytes = done_bytes;
+                    if self.progress.total_bytes < self.progress.done_bytes {
+                        self.progress.total_bytes = self.progress.done_bytes;
+                    }
                     self.progress.label = current;
+                }
+                TransferEvent::Conflict {
+                    source,
+                    destination,
+                    reply,
+                } => {
+                    if let Some(state) = &self.conflict_state {
+                        if let Ok(locked) = state.apply_to_all.lock() {
+                            if let Some(choice) = *locked {
+                                let _ = reply.send(choice);
+                                continue;
+                            }
+                        }
+                    }
+                    self.pending_conflict = Some(PendingConflict {
+                        source,
+                        destination,
+                        reply,
+                    });
                 }
                 TransferEvent::Done { invalidate } => {
                     self.invalidation = invalidate;
@@ -267,13 +294,8 @@ fn run_transfer(
     dest_dir: PathBuf,
     mode: TransferMode,
     event_tx: &Sender<TransferEvent>,
+    apply_to_all: Arc<Mutex<Option<ConflictChoice>>>,
 ) -> Result<(), String> {
-    let Some(kioclient) = detect_kioclient_binary() else {
-        return Err(
-            "Could not find `kioclient6`, `kioclient5`, or `kioclient` in PATH".to_string(),
-        );
-    };
-
     let mut done_files = 0usize;
     let mut done_bytes = 0u64;
     let mut invalidate = vec![dest_dir.clone()];
@@ -297,15 +319,18 @@ fn run_transfer(
             current: label.clone(),
         });
 
-        let (source_files, source_bytes) = transfer_stats(&source);
-        let dest = destination_path_for(&source, &dest_dir)?;
-        run_kioclient_command(kioclient, mode, &source, &dest_dir)?;
-        wait_for_transfer_completion(mode, &source, &dest, source_files, source_bytes)?;
+        let (files, bytes) = transfer_entry(
+            &source,
+            &dest_dir.join(file_name),
+            mode,
+            event_tx,
+            &apply_to_all,
+            &mut done_files,
+            &mut done_bytes,
+        )?;
 
-        done_files += source_files;
-        done_bytes += source_bytes;
+        let _ = (files, bytes);
         invalidate.push(source.clone());
-        invalidate.push(dest.clone());
         if source.parent().is_some() {
             invalidate.push(source.parent().unwrap().to_path_buf());
         }
@@ -320,112 +345,237 @@ fn run_transfer(
     Ok(())
 }
 
-fn run_kioclient_command(
-    kioclient: &str,
-    mode: TransferMode,
-    source: &Path,
-    dest_dir: &Path,
-) -> Result<(), String> {
-    let action = match mode {
-        TransferMode::Copy => "copy",
-        TransferMode::Move => "move",
-    };
-
-    let output = Command::new(kioclient)
-        .arg(action)
-        .arg(source.as_os_str())
-        .arg(dest_dir.as_os_str())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("Failed to run {kioclient} {action}: {error}"))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        Err(format!(
-            "{kioclient} {action} failed for {}",
-            source.display()
-        ))
-    } else {
-        Err(stderr)
-    }
-}
-
-fn detect_kioclient_binary() -> Option<&'static str> {
-    for candidate in ["kioclient6", "kioclient5", "kioclient"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn destination_path_for(source: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
-    let file_name = source
-        .file_name()
-        .ok_or_else(|| format!("Invalid source path: {}", source.display()))?;
-    Ok(dest_dir.join(file_name))
-}
-
-fn transfer_stats(path: &Path) -> (usize, u64) {
-    let mut files = 0usize;
-    let mut bytes = 0u64;
-    count_path(path, &mut files, &mut bytes);
-    (files.max(1), bytes)
-}
-
-fn wait_for_transfer_completion(
-    mode: TransferMode,
+fn transfer_entry(
     source: &Path,
     dest: &Path,
-    expected_files: usize,
-    expected_bytes: u64,
-) -> Result<(), String> {
-    let started = Instant::now();
-    while started.elapsed() <= KIO_COMPLETION_TIMEOUT {
-        let completed = match mode {
-            TransferMode::Copy => {
-                if !dest.exists() {
-                    false
-                } else {
-                    let (dest_files, dest_bytes) = transfer_stats(dest);
-                    dest_files >= expected_files && dest_bytes >= expected_bytes
-                }
-            }
-            TransferMode::Move => {
-                if source.exists() || !dest.exists() {
-                    false
-                } else {
-                    let (dest_files, dest_bytes) = transfer_stats(dest);
-                    dest_files >= expected_files && dest_bytes >= expected_bytes
-                }
-            }
-        };
-
-        if completed {
-            return Ok(());
-        }
-        thread::sleep(KIO_COMPLETION_POLL_INTERVAL);
+    mode: TransferMode,
+    event_tx: &Sender<TransferEvent>,
+    apply_to_all: &Arc<Mutex<Option<ConflictChoice>>>,
+    done_files: &mut usize,
+    done_bytes: &mut u64,
+) -> Result<(usize, u64), String> {
+    if source.is_dir() {
+        return transfer_directory(
+            source,
+            dest,
+            mode,
+            event_tx,
+            apply_to_all,
+            done_files,
+            done_bytes,
+        );
     }
 
-    Err(format!(
-        "Timed out waiting for {} operation to finish for {}",
-        match mode {
-            TransferMode::Copy => "copy",
-            TransferMode::Move => "move",
-        },
-        source.display()
-    ))
+    let actual_dest = resolve_destination(source, dest, event_tx, apply_to_all)?;
+    let Some(actual_dest) = actual_dest else {
+        return Ok((0, 0));
+    };
+
+    if mode == TransferMode::Move && !actual_dest.exists() {
+        let bytes = source.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if fs::rename(source, &actual_dest).is_ok() {
+            *done_files += 1;
+            *done_bytes += bytes;
+            let _ = event_tx.send(TransferEvent::Progress {
+                done_files: *done_files,
+                done_bytes: *done_bytes,
+                current: actual_dest
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+            return Ok((1, bytes));
+        }
+    }
+
+    let bytes = copy_file_with_progress(source, &actual_dest, event_tx, *done_files, *done_bytes)?;
+    *done_files += 1;
+    *done_bytes += bytes;
+    let _ = event_tx.send(TransferEvent::Progress {
+        done_files: *done_files,
+        done_bytes: *done_bytes,
+        current: actual_dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string(),
+    });
+
+    if mode == TransferMode::Move {
+        fs::remove_file(source).map_err(|e| e.to_string())?;
+    }
+
+    Ok((1, bytes))
+}
+
+fn transfer_directory(
+    source: &Path,
+    dest: &Path,
+    mode: TransferMode,
+    event_tx: &Sender<TransferEvent>,
+    apply_to_all: &Arc<Mutex<Option<ConflictChoice>>>,
+    done_files: &mut usize,
+    done_bytes: &mut u64,
+) -> Result<(usize, u64), String> {
+    let actual_dest = resolve_destination(source, dest, event_tx, apply_to_all)?;
+    let Some(actual_dest) = actual_dest else {
+        return Ok((0, 0));
+    };
+
+    fs::create_dir_all(&actual_dest).map_err(|e| e.to_string())?;
+
+    let mut added_files = 0usize;
+    let mut added_bytes = 0u64;
+
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let child_source = entry.path();
+        let child_dest = actual_dest.join(entry.file_name());
+        let (files, bytes) = transfer_entry(
+            &child_source,
+            &child_dest,
+            mode,
+            event_tx,
+            apply_to_all,
+            done_files,
+            done_bytes,
+        )?;
+        added_files += files;
+        added_bytes += bytes;
+    }
+
+    if mode == TransferMode::Move {
+        let _ = fs::remove_dir_all(source);
+    }
+
+    Ok((added_files, added_bytes))
+}
+
+fn resolve_destination(
+    source: &Path,
+    dest: &Path,
+    event_tx: &Sender<TransferEvent>,
+    apply_to_all: &Arc<Mutex<Option<ConflictChoice>>>,
+) -> Result<Option<PathBuf>, String> {
+    if !dest.exists() {
+        return Ok(Some(dest.to_path_buf()));
+    }
+
+    if let Ok(locked) = apply_to_all.lock() {
+        if let Some(choice) = *locked {
+            return Ok(apply_conflict_choice(dest, choice));
+        }
+    }
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    event_tx
+        .send(TransferEvent::Conflict {
+            source: source.to_path_buf(),
+            destination: dest.to_path_buf(),
+            reply: reply_tx,
+        })
+        .map_err(|e| e.to_string())?;
+
+    let choice = reply_rx
+        .recv()
+        .map_err(|_| "Conflict dialog closed".to_string())?;
+
+    if choice == ConflictChoice::Cancel {
+        return Err("Transfer cancelled".into());
+    }
+
+    Ok(apply_conflict_choice(dest, choice))
+}
+
+fn apply_conflict_choice(dest: &Path, choice: ConflictChoice) -> Option<PathBuf> {
+    match choice {
+        ConflictChoice::Skip => None,
+        ConflictChoice::Replace => {
+            if dest.is_dir() {
+                let _ = fs::remove_dir_all(dest);
+            } else if dest.is_file() {
+                let _ = fs::remove_file(dest);
+            }
+            Some(dest.to_path_buf())
+        }
+        ConflictChoice::Rename => Some(unique_path(dest)),
+        ConflictChoice::Cancel => None,
+    }
+}
+
+fn unique_path(dest: &Path) -> PathBuf {
+    if !dest.exists() {
+        return dest.to_path_buf();
+    }
+
+    let stem = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let extension = dest
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_default();
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+
+    for index in 1..10_000 {
+        let candidate = parent.join(format!("{stem} ({index}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    dest.to_path_buf()
+}
+
+fn copy_file_with_progress(
+    source: &Path,
+    dest: &Path,
+    event_tx: &Sender<TransferEvent>,
+    done_files: usize,
+    done_bytes_base: u64,
+) -> Result<u64, String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
+    let output = fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut output = BufWriter::with_capacity(COPY_BUFFER_SIZE, output);
+
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+    let mut copied = 0u64;
+    let mut last_emit = Instant::now();
+    let mut emitted_once = false;
+    let label = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    loop {
+        let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+        copied += read as u64;
+
+        if !emitted_once || last_emit.elapsed() >= PROGRESS_UPDATE_INTERVAL {
+            let _ = event_tx.send(TransferEvent::Progress {
+                done_files,
+                done_bytes: done_bytes_base + copied,
+                current: label.clone(),
+            });
+            last_emit = Instant::now();
+            emitted_once = true;
+        }
+    }
+
+    output.flush().map_err(|e| e.to_string())?;
+    Ok(copied)
 }
 
 pub fn path_disk_size(path: &Path) -> u64 {

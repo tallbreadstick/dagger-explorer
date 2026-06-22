@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use super::delete::{delete_paths_permanently, move_paths_to_trash};
 use super::directory_loading::DirectoryLoadingBar;
-use super::fs::{FsCache, open_path};
+use super::fs::{FsCache, open_path, read_file_entry, sort_cached_entries};
 use super::paths::home_dir;
 use super::preferences::Preferences;
 use super::tab::ExplorerTab;
@@ -15,6 +16,7 @@ use super::view::{
     selection_neighbor_index,
 };
 use super::{get_system_clipboard, has_file_clipboard, set_system_clipboard, ClipboardOp, ClipboardMode};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug)]
 pub struct TreeNode {
@@ -91,6 +93,9 @@ pub struct ExplorerState {
     last_clipboard_check: f64,
     pub path_bar_edit: Option<PathBarEditState>,
     pub quick_toast: Option<QuickToast>,
+    fs_notify_watcher: Option<RecommendedWatcher>,
+    fs_notify_rx: Option<Receiver<notify::Result<Event>>>,
+    fs_notify_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +136,9 @@ impl ExplorerState {
             last_clipboard_check: 0.0,
             path_bar_edit: None,
             quick_toast: None,
+            fs_notify_watcher: None,
+            fs_notify_rx: None,
+            fs_notify_dir: None,
         };
         state.fs_cache.request_listing(home);
         state
@@ -157,8 +165,13 @@ impl ExplorerState {
 
     pub fn poll_fs(&mut self, ctx: &egui::Context) {
         let active_path = self.active_path();
+        self.ensure_active_dir_watch(&active_path);
 
         if self.fs_cache.poll() {
+            ctx.request_repaint();
+        }
+
+        if self.poll_fs_notify_events(&active_path) {
             ctx.request_repaint();
         }
 
@@ -183,7 +196,99 @@ impl ExplorerState {
             self.apply_transfer_invalidation();
             ctx.request_repaint();
         }
+        if self.transfer.is_active() {
+            // Keep polling transfer events at a steady cadence so toast progress
+            // stays responsive even when there is no user input.
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
         self.refresh_clipboard_state(ctx);
+    }
+
+    fn ensure_active_dir_watch(&mut self, active_path: &Path) {
+        if self
+            .fs_notify_dir
+            .as_ref()
+            .is_some_and(|watched| watched == active_path)
+        {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut watcher) = notify::recommended_watcher(move |result| {
+            let _ = tx.send(result);
+        }) else {
+            self.fs_notify_watcher = None;
+            self.fs_notify_rx = None;
+            self.fs_notify_dir = None;
+            return;
+        };
+
+        if watcher
+            .watch(active_path, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            self.fs_notify_watcher = None;
+            self.fs_notify_rx = None;
+            self.fs_notify_dir = None;
+            return;
+        }
+
+        self.fs_notify_watcher = Some(watcher);
+        self.fs_notify_rx = Some(rx);
+        self.fs_notify_dir = Some(active_path.to_path_buf());
+    }
+
+    fn poll_fs_notify_events(&mut self, active_path: &Path) -> bool {
+        let Some(rx) = self.fs_notify_rx.as_ref() else {
+            return false;
+        };
+
+        let mut changed_paths = HashSet::new();
+        while let Ok(event_result) = rx.try_recv() {
+            if let Ok(event) = event_result {
+                for path in event.paths {
+                    if path.parent().is_some_and(|parent| parent == active_path) {
+                        changed_paths.insert(path);
+                    }
+                }
+            }
+        }
+
+        if changed_paths.is_empty() {
+            return false;
+        }
+
+        let Some(listing) = self.fs_cache.listing(active_path) else {
+            return false;
+        };
+        let Ok(mut guard) = listing.lock() else {
+            return false;
+        };
+        if !guard.complete {
+            return false;
+        }
+
+        let mut any_change = false;
+        for path in changed_paths {
+            if path.exists() {
+                if let Some(new_entry) = read_file_entry(&path) {
+                    if let Some(index) = guard.entries.iter().position(|entry| entry.path == path) {
+                        guard.entries[index] = new_entry;
+                    } else {
+                        guard.entries.push(new_entry);
+                    }
+                    any_change = true;
+                }
+            } else if let Some(index) = guard.entries.iter().position(|entry| entry.path == path) {
+                guard.entries.remove(index);
+                any_change = true;
+            }
+        }
+
+        if any_change {
+            sort_cached_entries(&mut guard.entries);
+        }
+        any_change
     }
 
     fn is_directory_loading(&self, path: &Path) -> bool {

@@ -185,7 +185,7 @@ fn path_bar_editor(
         .font(egui::FontId::proportional(12.0))
         .desired_width(width)
         .margin(egui::Margin::ZERO)
-        .lock_focus(true)
+        .lock_focus(false)
         .show(ui);
     let response = &output.response;
     response.request_focus();
@@ -292,7 +292,11 @@ fn path_bar_editor(
         return PathBarEditAction::None;
     }
 
-    if response.lost_focus() && !Popup::is_any_open(ui.ctx()) {
+    let clicked_elsewhere = response.has_focus()
+        && ui.input(|input| input.pointer.primary_clicked())
+        && !response.hovered()
+        && !Popup::is_any_open(ui.ctx());
+    if clicked_elsewhere || (response.lost_focus() && !Popup::is_any_open(ui.ctx())) {
         action = PathBarEditAction::Commit;
     }
 

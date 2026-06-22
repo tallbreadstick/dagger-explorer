@@ -89,6 +89,28 @@ fn sort_entries(entries: &mut [FileEntry]) {
     });
 }
 
+pub fn sort_cached_entries(entries: &mut [FileEntry]) {
+    sort_entries(entries);
+}
+
+pub fn read_file_entry(path: &Path) -> Option<FileEntry> {
+    let metadata = path.metadata().ok()?;
+    let name = path.file_name()?.to_str()?.to_string();
+    let is_dir = metadata.is_dir();
+    let modified = metadata.modified().ok()?;
+    let size = if is_dir { 0 } else { metadata.len() };
+    let is_hidden = is_hidden_entry(&name, &metadata);
+
+    Some(FileEntry {
+        name,
+        path: path.to_path_buf(),
+        is_dir,
+        size,
+        modified,
+        is_hidden,
+    })
+}
+
 enum ListingEvent {
     Entry(FileEntry),
     Complete,
