@@ -35,6 +35,7 @@ impl eframe::App for DaggerExplorerApp {
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.request_native_blur(frame);
+        self.explorer.handle_keyboard_shortcuts(ctx);
         self.explorer.poll_fs(ctx);
     }
 

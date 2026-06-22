@@ -19,6 +19,27 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
+/// Application data directory: `~/.local/share/dagger` (Linux/macOS) or `%LOCALAPPDATA%\dagger` (Windows).
+pub fn data_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA")
+            .map(|root| PathBuf::from(root).join("dagger"))
+            .unwrap_or_else(|_| home_dir().join("AppData\\Local\\dagger"))
+    } else if cfg!(target_os = "macos") {
+        home_dir().join("Library/Application Support/dagger")
+    } else {
+        home_dir().join(".local/share/dagger")
+    }
+}
+
+pub fn preferences_path() -> PathBuf {
+    data_dir().join("preferences.json")
+}
+
+pub fn thumbs_db_path() -> PathBuf {
+    data_dir().join("thumbs.db")
+}
+
 fn user_subdir(name: &str) -> PathBuf {
     home_dir().join(name)
 }
@@ -128,14 +149,10 @@ pub fn tab_display_name(path: &Path) -> String {
 }
 
 fn segment_display_name(path: &Path) -> String {
-    if path == home_dir().as_path() {
-        "Home".to_string()
-    } else {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| path.display().to_string())
-    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 pub fn path_components(path: &Path) -> Vec<(String, PathBuf)> {
@@ -187,4 +204,122 @@ pub fn is_filesystem_root(path: &Path) -> bool {
     } else {
         path == Path::new("/")
     }
+}
+
+pub fn expand_tilde(text: &str) -> String {
+    if text == "~" {
+        return home_dir().to_string_lossy().into_owned();
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return format!("{}/{}", home_dir().display(), rest);
+    }
+    if let Some(rest) = text.strip_prefix("~\\") {
+        return format!("{}\\{}", home_dir().display(), rest);
+    }
+    text.to_string()
+}
+
+/// Parent directory and partial final segment for tab completion.
+pub fn path_completion_context(input: &str) -> (PathBuf, String) {
+    let expanded = expand_tilde(input);
+    let path = PathBuf::from(&expanded);
+
+    if input.ends_with('/') || input.ends_with('\\') {
+        return (path, String::new());
+    }
+
+    if let Some(prefix) = path.file_name().and_then(|name| name.to_str()).filter(|s| !s.is_empty())
+    {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            return (parent.to_path_buf(), prefix.to_string());
+        }
+        if expanded.starts_with('/') {
+            return (PathBuf::from("/"), prefix.to_string());
+        }
+        if expanded.contains(':') && cfg!(target_os = "windows") {
+            return (path, String::new());
+        }
+    }
+
+    if path.as_os_str().is_empty() {
+        (PathBuf::new(), expanded)
+    } else {
+        (path, String::new())
+    }
+}
+
+pub fn list_directory_completions(parent: &Path, prefix: &str) -> Vec<PathBuf> {
+    if !parent.is_dir() {
+        return Vec::new();
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut matches: Vec<PathBuf> = read_dir
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                if prefix.is_empty() {
+                    true
+                } else {
+                    name.to_ascii_lowercase().starts_with(&prefix_lower)
+                }
+            })
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    matches.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    });
+    matches
+}
+
+pub fn apply_path_completion(input: &mut String, completion: &Path) {
+    let (_, prefix) = path_completion_context(input);
+    let name = completion
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+
+    if prefix.is_empty() && (input.ends_with('/') || input.ends_with('\\')) {
+        input.push_str(name);
+    } else if !prefix.is_empty() {
+        let new_len = input.len().saturating_sub(prefix.len());
+        input.truncate(new_len);
+        input.push_str(name);
+    } else {
+        *input = completion.display().to_string();
+        return;
+    }
+
+    let sep = if input.contains('\\') { '\\' } else { '/' };
+    if !input.ends_with(sep) {
+        input.push(sep);
+    }
+}
+
+pub fn resolve_directory_path(text: &str, cwd: &Path) -> Option<PathBuf> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let expanded = expand_tilde(trimmed);
+    let path = PathBuf::from(&expanded);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+
+    resolved.is_dir().then_some(resolved)
 }

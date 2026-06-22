@@ -88,6 +88,9 @@
             cargo-watch
             pkg-config
             openssl
+            curl
+            unzip
+            ffmpeg
           ];
 
           buildInputs = guiRuntimeLibs;

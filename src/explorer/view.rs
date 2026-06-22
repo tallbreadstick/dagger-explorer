@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::fs::FileEntry;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     #[default]
     SmallIcons,
@@ -103,6 +106,13 @@ impl FileViewOptions {
         self.renaming = Some(RenameState { path, text });
     }
 
+    pub fn add_to_selection(&mut self, path: PathBuf) {
+        if self.is_selected(&path) {
+            return;
+        }
+        self.selected.push(path);
+    }
+
     pub fn on_directory_changed(&mut self) {
         self.clear_selection();
     }
@@ -162,4 +172,83 @@ fn type_key(entry: &FileEntry) -> String {
 
 pub fn multi_select_modifiers(modifiers: &eframe::egui::Modifiers) -> bool {
     modifiers.ctrl || modifiers.shift || modifiers.command || modifiers.mac_cmd
+}
+
+const GRID_TILE_GAP: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearDirection {
+    Next,
+    Prev,
+}
+
+/// Spacebar / linear traversal direction for shift-extend in each view mode.
+pub fn linear_extend_direction(mode: ViewMode, key: eframe::egui::Key) -> Option<LinearDirection> {
+    use eframe::egui::Key;
+
+    match mode {
+        ViewMode::SmallIcons | ViewMode::LargeIcons => match key {
+            Key::ArrowRight | Key::Space => Some(LinearDirection::Next),
+            Key::ArrowLeft => Some(LinearDirection::Prev),
+            _ => None,
+        },
+        ViewMode::SmallList | ViewMode::LargeList => match key {
+            Key::ArrowDown | Key::Space => Some(LinearDirection::Next),
+            Key::ArrowUp => Some(LinearDirection::Prev),
+            _ => None,
+        },
+    }
+}
+
+fn grid_tile_width(mode: ViewMode) -> f32 {
+    match mode {
+        ViewMode::SmallIcons => 72.0,
+        ViewMode::LargeIcons => 96.0,
+        ViewMode::SmallList | ViewMode::LargeList => 0.0,
+    }
+}
+
+pub fn grid_columns(panel_width: f32, mode: ViewMode) -> usize {
+    let tile_width = grid_tile_width(mode);
+    if tile_width <= 0.0 {
+        return 1;
+    }
+    let tile_step = tile_width + GRID_TILE_GAP;
+    ((panel_width / tile_step).floor() as usize).max(1)
+}
+
+/// Next entry index when navigating with arrow keys; `None` if the selection stays put.
+pub fn selection_neighbor_index(
+    current: usize,
+    count: usize,
+    mode: ViewMode,
+    panel_width: f32,
+    key: eframe::egui::Key,
+) -> Option<usize> {
+    if count == 0 || current >= count {
+        return None;
+    }
+
+    match mode {
+        ViewMode::SmallList | ViewMode::LargeList => match key {
+            eframe::egui::Key::ArrowUp => current.checked_sub(1),
+            eframe::egui::Key::ArrowDown if current + 1 < count => Some(current + 1),
+            _ => None,
+        },
+        ViewMode::SmallIcons | ViewMode::LargeIcons => {
+            let cols = grid_columns(panel_width, mode);
+            let row = current / cols;
+            let col = current % cols;
+
+            match key {
+                eframe::egui::Key::ArrowLeft if col > 0 => Some(current - 1),
+                eframe::egui::Key::ArrowRight if col + 1 < cols && current + 1 < count => {
+                    Some(current + 1)
+                }
+                eframe::egui::Key::ArrowUp if row > 0 => Some(current.saturating_sub(cols)),
+                eframe::egui::Key::ArrowDown if current + cols < count => Some(current + cols),
+                _ => None,
+            }
+        }
+    }
 }

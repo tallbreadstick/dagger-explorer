@@ -1,16 +1,24 @@
-mod fs;
-mod format;
 mod clipboard;
+mod delete;
+mod directory_loading;
+mod format;
+mod fs;
 mod paths;
+mod preferences;
 mod state;
 mod tab;
+mod thumbs;
 mod transfer;
 mod view;
 
 pub use clipboard::{get_system_clipboard, has_file_clipboard, set_system_clipboard, ClipboardOp};
+pub use delete::{delete_paths_permanently, move_paths_to_trash};
 pub use format::{format_size_kb, item_count_label};
 pub use fs::{FileEntry, open_path};
-pub use paths::{list_drives, path_components, quick_access_entries, QuickAccessEntry};
+pub use paths::{
+    apply_path_completion, list_directory_completions, list_drives, path_completion_context,
+    path_components, quick_access_entries, QuickAccessEntry,
+};
 pub use state::{ExplorerState, SelectionMarquee};
 pub use transfer::{ConflictChoice, TransferManager};
 pub use view::{

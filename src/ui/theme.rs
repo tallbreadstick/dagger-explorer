@@ -82,4 +82,8 @@ pub fn apply(ctx: &egui::Context) {
     visuals.window_corner_radius = CornerRadius::same(10);
     visuals.menu_corner_radius = CornerRadius::same(6);
     ctx.set_visuals(visuals);
+    // File lists swap widget trees on navigation; disable egui's dev-only red outline.
+    ctx.global_style_mut(|style| {
+        style.debug.warn_if_rect_changes_id = false;
+    });
 }

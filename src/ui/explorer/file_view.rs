@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
-    self, Align2, Color32, Frame, Key, LayerId, Order, Rect, Response, ScrollArea, Sense, Ui,
-    UiBuilder, vec2,
+    self, Align2, Color32, Frame, Key, LayerId, Order, Rect, Response, ScrollArea, Sense, Shape,
+    Stroke, Ui, UiBuilder, pos2, vec2,
 };
 use eframe::egui::containers::scroll_area::ScrollSource;
 
@@ -14,11 +14,13 @@ use crate::ui::{theme, text};
 
 const MARQUEE_MIN: f32 = 3.0;
 const MARQUEE_PREVIEW_MAX: usize = 150;
+const MAX_ICON_FILL: f32 = 0.75;
+const TILE_LABEL_HEIGHT: f32 = 32.0;
+const LIST_ICON_COLUMN_PADDING: f32 = 16.0;
 
 struct ViewMetrics {
     tile_width: f32,
     tile_height: f32,
-    icon_size: f32,
     label_size: f32,
     list_mode: bool,
     list_row_height: f32,
@@ -44,7 +46,6 @@ impl ViewMetrics {
             ViewMode::SmallIcons => Self {
                 tile_width: 72.0,
                 tile_height: 72.0,
-                icon_size: 22.0,
                 label_size: 10.0,
                 list_mode: false,
                 list_row_height: 0.0,
@@ -53,7 +54,6 @@ impl ViewMetrics {
             ViewMode::LargeIcons => Self {
                 tile_width: 96.0,
                 tile_height: 96.0,
-                icon_size: 28.0,
                 label_size: 11.0,
                 list_mode: false,
                 list_row_height: 0.0,
@@ -62,7 +62,6 @@ impl ViewMetrics {
             ViewMode::SmallList => Self {
                 tile_width: 0.0,
                 tile_height: 0.0,
-                icon_size: 16.0,
                 label_size: 11.0,
                 list_mode: true,
                 list_row_height: 24.0,
@@ -71,13 +70,39 @@ impl ViewMetrics {
             ViewMode::LargeList => Self {
                 tile_width: 0.0,
                 tile_height: 0.0,
-                icon_size: 22.0,
                 label_size: 12.0,
                 list_mode: true,
                 list_row_height: 36.0,
                 detail_size: 11.0,
             },
         }
+    }
+
+    /// Longest side of icons/thumbnails, up to 75% of the available cell space.
+    fn icon_max_side(&self) -> f32 {
+        if self.list_mode {
+            self.list_row_height * MAX_ICON_FILL
+        } else {
+            let icon_width = self.tile_width;
+            let icon_height = (self.tile_height - TILE_LABEL_HEIGHT).max(1.0);
+            icon_width.min(icon_height) * MAX_ICON_FILL
+        }
+    }
+
+    fn list_icon_column_width(&self) -> f32 {
+        self.icon_max_side() + LIST_ICON_COLUMN_PADDING
+    }
+
+    fn tile_icon_center(&self, rect: Rect) -> egui::Pos2 {
+        let icon_area = Rect {
+            min: rect.min,
+            max: egui::pos2(rect.max.x, rect.max.y - TILE_LABEL_HEIGHT),
+        };
+        icon_area.center()
+    }
+
+    fn tile_label_center(&self, rect: Rect) -> egui::Pos2 {
+        rect.center() + vec2(0.0, (self.tile_height - TILE_LABEL_HEIGHT) * 0.5)
     }
 }
 
@@ -146,112 +171,158 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
         ui.set_min_height(area.height());
 
         Frame::new()
-            .fill(theme::glass_fill())
-            .inner_margin(12.0)
+            .fill(egui::Color32::TRANSPARENT)
+            .inner_margin(egui::Margin::symmetric(8, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.set_min_height(area.height() - 24.0);
+                ui.set_max_width(ui.available_width());
+                ui.set_min_height(area.height() - 16.0);
 
-                if let Some(listing) = state.fs_cache.listing(&path) {
-                    let entries = prepare_entries(listing.as_ref(), &state.view_options);
-
-                    if entries.is_empty() {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new("This folder is empty.")
-                                    .color(theme::text_muted()),
-                            );
-                        });
-                        handle_rename_input(ui, state);
-                        return;
-                    }
-
-                    let mut item_rects = Vec::new();
-                    let width = ui.available_width();
-                    let viewport_h = ui.available_height();
-                    let content_h =
-                        content_height(entries.len(), &metrics, width, viewport_h);
-
-                    ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .scroll_source(ScrollSource::MOUSE_WHEEL | ScrollSource::SCROLL_BAR)
-                        .show(ui, |ui| {
-                            let origin = ui.cursor().min;
-                            let content_rect =
-                                Rect::from_min_size(origin, vec2(width, content_h));
-                            let bg_response = ui.interact(
-                                content_rect,
-                                ui.id().with("marquee_bg"),
-                                Sense::click_and_drag(),
-                            );
-
-                            ui.scope_builder(UiBuilder::new().max_rect(content_rect), |ui| {
-                                ui.set_min_size(content_rect.size());
-
-                                if metrics.list_mode {
-                                    list_header(ui, &metrics, width);
-                                    ui.add_space(2.0);
-                                    for entry in &entries {
-                                        if let Some(item) = list_row(
-                                            ui,
-                                            state,
-                                            entry,
-                                            &metrics,
-                                            show_extensions,
-                                            width,
-                                        ) {
-                                            item_rects.push(item);
-                                        }
-                                    }
-                                } else {
-                                    let cols = ((width / metrics.tile_width).floor() as usize)
-                                        .max(1);
-
-                                    egui::Grid::new("file_grid")
-                                        .num_columns(cols)
-                                        .spacing(vec2(8.0, 8.0))
-                                        .show(ui, |ui| {
-                                            for (index, entry) in entries.iter().enumerate() {
-                                                if let Some(item) = icon_tile(
-                                                    ui,
-                                                    state,
-                                                    entry,
-                                                    &metrics,
-                                                    show_extensions,
-                                                ) {
-                                                    item_rects.push(item);
-                                                }
-                                                if (index + 1) % cols == 0 {
-                                                    ui.end_row();
-                                                }
-                                            }
-                                        });
-                                }
-                            });
-
-                            let layout_rect = ui.min_rect();
-                            handle_marquee(
-                                ui,
-                                state,
-                                &bg_response,
-                                &item_rects,
-                                layout_rect,
-                            );
-                        });
-
-                    let clip = state.file_view_bounds.unwrap_or(area);
-                    paint_marquee_overlay(ui.ctx(), state, &item_rects, clip);
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new("Loading…").color(theme::text_muted()),
-                        );
-                    });
+                if let Some(clip) = state.file_view_bounds {
+                    ui.set_clip_rect(clip);
                 }
 
+                let width = ui.available_width();
+                let viewport_h = ui.available_height();
+
+                enum FileViewBody {
+                    Loading,
+                    Empty,
+                    Entries(Vec<FileEntry>),
+                }
+
+                let body = if let Some(listing) = state.fs_cache.listing(&path) {
+                    let listing_guard = listing.lock().expect("directory listing lock");
+                    let entries = prepare_entries(&listing_guard.entries, &state.view_options);
+                    let listing_incomplete = !listing_guard.complete;
+                    drop(listing_guard);
+
+                    if entries.is_empty() && listing_incomplete {
+                        FileViewBody::Loading
+                    } else if entries.is_empty() {
+                        FileViewBody::Empty
+                    } else {
+                        FileViewBody::Entries(entries)
+                    }
+                } else {
+                    FileViewBody::Loading
+                };
+
+                let content_h = match &body {
+                    FileViewBody::Loading | FileViewBody::Empty => viewport_h,
+                    FileViewBody::Entries(entries) => {
+                        content_height(entries.len(), &metrics, width, viewport_h)
+                    }
+                };
+
+                let mut item_rects = Vec::new();
+
+                ScrollArea::vertical()
+                    .id_salt("file_view_scroll")
+                    .auto_shrink([false, false])
+                    .scroll_source(ScrollSource::MOUSE_WHEEL | ScrollSource::SCROLL_BAR)
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.set_max_width(width);
+                        let origin = ui.cursor().min;
+                        let content_rect =
+                            Rect::from_min_size(origin, vec2(width, content_h));
+                        let bg_response = ui.interact(
+                            content_rect,
+                            ui.id().with("marquee_bg"),
+                            Sense::click_and_drag(),
+                        );
+
+                        ui.scope_builder(UiBuilder::new().max_rect(content_rect), |ui| {
+                            ui.set_min_size(content_rect.size());
+
+                            match &body {
+                                FileViewBody::Loading => {
+                                    ui.with_layout(
+                                        egui::Layout::centered_and_justified(
+                                            egui::Direction::TopDown,
+                                        ),
+                                        |ui| {
+                                            ui.spinner();
+                                            ui.label(
+                                                egui::RichText::new("Loading…")
+                                                    .color(theme::text_muted()),
+                                            );
+                                        },
+                                    );
+                                }
+                                FileViewBody::Empty => {
+                                    ui.with_layout(
+                                        egui::Layout::centered_and_justified(
+                                            egui::Direction::TopDown,
+                                        ),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("This folder is empty.")
+                                                    .color(theme::text_muted()),
+                                            );
+                                        },
+                                    );
+                                }
+                                FileViewBody::Entries(entries) => {
+                                    if metrics.list_mode {
+                                        list_header(ui, &metrics, width);
+                                        ui.add_space(2.0);
+                                        for entry in entries {
+                                            if let Some(item) = list_row(
+                                                ui,
+                                                state,
+                                                entry,
+                                                &metrics,
+                                                show_extensions,
+                                                width,
+                                            ) {
+                                                item_rects.push(item);
+                                            }
+                                        }
+                                    } else {
+                                        let tile_step = metrics.tile_width + 8.0;
+                                        let cols =
+                                            ((width / tile_step).floor() as usize).max(1);
+
+                                        egui::Grid::new("file_grid")
+                                            .num_columns(cols)
+                                            .spacing(vec2(8.0, 8.0))
+                                            .show(ui, |ui| {
+                                                for (index, entry) in entries.iter().enumerate() {
+                                                    if let Some(item) = icon_tile(
+                                                        ui,
+                                                        state,
+                                                        entry,
+                                                        &metrics,
+                                                        show_extensions,
+                                                    ) {
+                                                        item_rects.push(item);
+                                                    }
+                                                    if (index + 1) % cols == 0 {
+                                                        ui.end_row();
+                                                    }
+                                                }
+                                            });
+                                    }
+                                }
+                            }
+                        });
+
+                        let layout_rect = ui.min_rect();
+                        handle_marquee(
+                            ui,
+                            state,
+                            &bg_response,
+                            &item_rects,
+                            layout_rect,
+                        );
+                    });
+
+                let clip = state.file_view_bounds.unwrap_or(area);
+                paint_marquee_overlay(ui.ctx(), state, &item_rects, clip);
+
                 handle_rename_input(ui, state);
-                state.handle_clipboard_shortcuts(ui);
             });
     });
 }
@@ -266,7 +337,8 @@ fn content_height(
         let header = metrics.list_row_height + 2.0;
         header + entry_count as f32 * metrics.list_row_height
     } else {
-        let cols = ((width / metrics.tile_width).floor() as usize).max(1);
+        let tile_step = metrics.tile_width + 8.0;
+        let cols = ((width / tile_step).floor() as usize).max(1);
         let rows = entry_count.div_ceil(cols);
         rows as f32 * (metrics.tile_height + 8.0)
     };
@@ -418,7 +490,7 @@ fn handle_rename_input(ui: &mut Ui, state: &mut ExplorerState) {
 }
 
 fn list_header(ui: &mut Ui, metrics: &ViewMetrics, row_width: f32) {
-    let icon_width = metrics.icon_size + 16.0;
+    let icon_width = metrics.list_icon_column_width();
     let cols = ListColumns::layout(row_width, icon_width);
     let header_height = metrics.list_row_height - 4.0;
     let font = egui::FontId::proportional(metrics.detail_size);
@@ -481,7 +553,6 @@ fn icon_tile(
     metrics: &ViewMetrics,
     show_extensions: bool,
 ) -> Option<ItemRect> {
-    let icon = if entry.is_dir { "📁" } else { "📄" };
     let path = entry.path.clone();
     let is_dir = entry.is_dir;
     let label = entry.display_name(show_extensions);
@@ -500,21 +571,22 @@ fn icon_tile(
 
     paint_item_background(ui, rect, selected, response.hovered(), 6.0);
 
-    ui.painter().text(
-        rect.center() + vec2(0.0, -12.0),
-        Align2::CENTER_CENTER,
-        icon,
-        egui::FontId::proportional(metrics.icon_size),
+    paint_file_icon(
+        ui,
+        state,
+        entry,
+        metrics.tile_icon_center(rect),
+        metrics.icon_max_side(),
         text_color,
     );
 
     let label_rect = egui::Rect::from_center_size(
-        rect.center() + vec2(0.0, metrics.tile_height * 0.28),
-        vec2(metrics.tile_width - 8.0, 32.0),
+        metrics.tile_label_center(rect),
+        vec2(metrics.tile_width - 8.0, TILE_LABEL_HEIGHT),
     );
 
     if renaming {
-        show_rename_field(ui, state, &path, label_rect);
+        show_rename_field(ui, state, &path, label_rect, Align2::CENTER_CENTER);
     } else {
         text::paint_truncated(
             ui,
@@ -539,13 +611,12 @@ fn list_row(
     show_extensions: bool,
     row_width: f32,
 ) -> Option<ItemRect> {
-    let icon = if entry.is_dir { "📁" } else { "📄" };
     let path = entry.path.clone();
     let is_dir = entry.is_dir;
     let label = entry.display_name(show_extensions);
     let selected = state.view_options.is_selected(&path);
     let renaming = is_renaming(&state.view_options.renaming, &path);
-    let icon_width = metrics.icon_size + 16.0;
+    let icon_width = metrics.list_icon_column_width();
     let cols = ListColumns::layout(row_width, icon_width);
     let name_font = egui::FontId::proportional(metrics.label_size);
     let detail_font = egui::FontId::proportional(metrics.detail_size);
@@ -560,69 +631,138 @@ fn list_row(
         theme::text_muted()
     };
 
-    let mut item_rect = None;
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(row_width, metrics.list_row_height),
+        Sense::click(),
+    );
 
-    ui.horizontal(|ui| {
-        let (rect, response) = ui.allocate_exact_size(
-            vec2(row_width, metrics.list_row_height),
-            Sense::click(),
-        );
+    paint_item_background(ui, rect, selected, response.hovered(), 4.0);
 
-        item_rect = Some(ItemRect {
-            path: path.clone(),
+    let icon_side = metrics.icon_max_side();
+    let icon_center = pos2(
+        rect.min.x + LIST_ICON_COLUMN_PADDING * 0.5 + icon_side * 0.5,
+        rect.center().y,
+    );
+    paint_file_icon(ui, state, entry, icon_center, icon_side, primary);
+
+    let name_rect = cell_rect(rect, cols.name_start(rect.min.x), cols.name_end(rect.min.x));
+    if renaming {
+        show_rename_field(ui, state, &path, name_rect, Align2::LEFT_CENTER);
+    } else {
+        paint_list_cell(ui, name_rect, &label, &name_font, primary, Align2::LEFT_CENTER);
+    }
+
+    paint_list_cell(
+        ui,
+        cell_rect(
             rect,
-        });
+            cols.modified_start(rect.min.x),
+            cols.modified_end(rect.min.x),
+        ),
+        &entry.formatted_modified(),
+        &detail_font,
+        muted,
+        Align2::LEFT_CENTER,
+    );
+    paint_list_cell(
+        ui,
+        cell_rect(rect, cols.kind_start(rect.min.x), cols.kind_end(rect.min.x)),
+        &entry.type_label(),
+        &detail_font,
+        muted,
+        Align2::LEFT_CENTER,
+    );
+    paint_list_cell(
+        ui,
+        cell_rect(rect, cols.size_start(rect.min.x), cols.size_end(rect.min.x)),
+        &entry.formatted_size(),
+        &detail_font,
+        muted,
+        Align2::RIGHT_CENTER,
+    );
 
-        paint_item_background(ui, rect, selected, response.hovered(), 4.0);
+    handle_item_click(ui, state, &response, path.clone(), is_dir, label);
 
+    Some(ItemRect { path, rect })
+}
+
+fn paint_file_icon(
+    ui: &Ui,
+    state: &mut ExplorerState,
+    entry: &FileEntry,
+    center: egui::Pos2,
+    size: f32,
+    fallback_color: Color32,
+) {
+    if entry.is_dir {
         ui.painter().text(
-            rect.left_center() + vec2(8.0, 0.0),
-            Align2::LEFT_CENTER,
-            icon,
-            egui::FontId::proportional(metrics.icon_size),
-            primary,
+            center,
+            Align2::CENTER_CENTER,
+            "📁",
+            egui::FontId::proportional(size),
+            fallback_color,
         );
+        return;
+    }
 
-        let name_rect = cell_rect(rect, cols.name_start(rect.min.x), cols.name_end(rect.min.x));
-        if renaming {
-            show_rename_field(ui, state, &path, name_rect);
-        } else {
-            paint_list_cell(ui, name_rect, &label, &name_font, primary, Align2::LEFT_CENTER);
+    if let (Some(texture), Some(display)) = (
+        state.thumbnails.texture(&entry.path),
+        state.thumbnails.display_size(&entry.path, size),
+    ) {
+        let rect = Rect::from_center_size(center, display);
+        ui.painter().image(
+            texture,
+            rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        if state.thumbnails.is_video_thumbnail(&entry.path) {
+            paint_video_play_overlay(ui.painter(), rect);
         }
-
-        paint_list_cell(
-            ui,
-            cell_rect(
-                rect,
-                cols.modified_start(rect.min.x),
-                cols.modified_end(rect.min.x),
-            ),
-            &entry.formatted_modified(),
-            &detail_font,
-            muted,
-            Align2::LEFT_CENTER,
+    } else {
+        ui.painter().text(
+            center,
+            Align2::CENTER_CENTER,
+            "📄",
+            egui::FontId::proportional(size),
+            fallback_color,
         );
-        paint_list_cell(
-            ui,
-            cell_rect(rect, cols.kind_start(rect.min.x), cols.kind_end(rect.min.x)),
-            &entry.type_label(),
-            &detail_font,
-            muted,
-            Align2::LEFT_CENTER,
-        );
-        paint_list_cell(
-            ui,
-            cell_rect(rect, cols.size_start(rect.min.x), cols.size_end(rect.min.x)),
-            &entry.formatted_size(),
-            &detail_font,
-            muted,
-            Align2::RIGHT_CENTER,
-        );
+    }
+}
 
-        handle_item_click(ui, state, &response, path.clone(), is_dir, label);
-    });
+fn paint_video_play_overlay(painter: &egui::Painter, thumb_rect: Rect) {
+    let badge = thumb_rect.width().min(thumb_rect.height()) * 0.34;
+    if badge < 6.0 {
+        return;
+    }
 
-    item_rect
+    let center = thumb_rect.center();
+    let radius = badge * 0.52;
+    painter.circle_filled(
+        center,
+        radius,
+        Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+    );
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
+    );
+
+    let half_h = badge * 0.22;
+    let half_w = badge * 0.20;
+    let tip = vec2(half_w * 0.85, 0.0);
+    let left = vec2(-half_w * 0.55, -half_h);
+    let right = vec2(-half_w * 0.55, half_h);
+    painter.add(Shape::convex_polygon(
+        vec![
+            center + left,
+            center + right,
+            center + tip,
+        ],
+        Color32::WHITE,
+        Stroke::NONE,
+    ));
 }
 
 fn paint_item_background(ui: &Ui, rect: Rect, selected: bool, hovered: bool, radius: f32) {
@@ -643,7 +783,13 @@ fn is_renaming(renaming: &Option<crate::explorer::RenameState>, path: &Path) -> 
     renaming.as_ref().is_some_and(|rename| rename.path == path)
 }
 
-fn show_rename_field(ui: &mut Ui, state: &mut ExplorerState, path: &Path, rect: Rect) {
+fn show_rename_field(
+    ui: &mut Ui,
+    state: &mut ExplorerState,
+    path: &Path,
+    rect: Rect,
+    align: Align2,
+) {
     let Some(rename) = state.view_options.renaming.as_mut() else {
         return;
     };
@@ -651,11 +797,21 @@ fn show_rename_field(ui: &mut Ui, state: &mut ExplorerState, path: &Path, rect: 
         return;
     }
 
-    let response = ui.put(
+    let (h_align, v_align) = match align {
+        Align2::LEFT_CENTER => (egui::Align::LEFT, egui::Align::Center),
+        Align2::CENTER_CENTER => (egui::Align::Center, egui::Align::Center),
+        _ => (egui::Align::LEFT, egui::Align::Center),
+    };
+
+    let response = ui.place(
         rect,
         egui::TextEdit::singleline(&mut rename.text)
+            .id(ui.id().with("rename").with(path))
             .font(egui::FontId::proportional(12.0))
-            .desired_width(rect.width()),
+            .desired_width(rect.width())
+            .horizontal_align(h_align)
+            .vertical_align(v_align)
+            .margin(egui::Margin::ZERO),
     );
     response.request_focus();
 }

@@ -1,6 +1,7 @@
 mod file_panel;
 mod file_view;
 mod layout;
+mod loading_bar;
 mod nav_bar;
 mod sidebar;
 mod status_bar;

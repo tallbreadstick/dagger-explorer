@@ -1,11 +1,14 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use jwalk::WalkDir;
+
+const SMALL_FILE_FAST_COPY_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferMode {
@@ -24,6 +27,8 @@ pub enum ConflictChoice {
 #[derive(Clone, Debug, Default)]
 pub struct TransferProgress {
     pub active: bool,
+    pub counting: bool,
+    pub operation: String,
     pub label: String,
     pub total_files: usize,
     pub done_files: usize,
@@ -43,6 +48,10 @@ struct ConflictState {
 }
 
 enum TransferEvent {
+    Totals {
+        total_files: usize,
+        total_bytes: u64,
+    },
     Progress {
         done_files: usize,
         done_bytes: u64,
@@ -106,16 +115,31 @@ impl TransferManager {
         self.pending_conflict = None;
         self.event_rx = Some(event_rx);
 
-        let (total_files, total_bytes) = count_transfer(sources.as_slice());
+        let operation = match mode {
+            TransferMode::Copy => "Copying".to_string(),
+            TransferMode::Move => "Moving".to_string(),
+        };
         self.progress = TransferProgress {
             active: true,
-            label: "Preparing…".to_string(),
-            total_files,
+            counting: true,
+            operation,
+            label: "Starting transfer…".to_string(),
+            total_files: 0,
             done_files: 0,
-            total_bytes,
+            total_bytes: 0,
             done_bytes: 0,
             error: None,
         };
+
+        let count_sources = sources.clone();
+        let count_tx = event_tx.clone();
+        thread::spawn(move || {
+            let (total_files, total_bytes) = count_transfer(count_sources.as_slice());
+            let _ = count_tx.send(TransferEvent::Totals {
+                total_files,
+                total_bytes,
+            });
+        });
 
         thread::spawn(move || {
             let result = run_transfer(sources, dest_dir, mode, &event_tx, apply_to_all);
@@ -138,11 +162,23 @@ impl TransferManager {
 
         for event in events {
             match event {
+                TransferEvent::Totals {
+                    total_files,
+                    total_bytes,
+                } => {
+                    if total_files > 0 {
+                        self.progress.total_files = total_files;
+                    }
+                    if total_bytes > 0 {
+                        self.progress.total_bytes = total_bytes;
+                    }
+                }
                 TransferEvent::Progress {
                     done_files,
                     done_bytes,
                     current,
                 } => {
+                    self.progress.counting = false;
                     self.progress.done_files = done_files;
                     self.progress.done_bytes = done_bytes;
                     self.progress.label = current;
@@ -348,6 +384,15 @@ fn transfer_entry(
     let bytes = copy_file_with_progress(source, &actual_dest, event_tx, *done_files, done_bytes)?;
     *done_files += 1;
     *done_bytes += bytes;
+    let _ = event_tx.send(TransferEvent::Progress {
+        done_files: *done_files,
+        done_bytes: *done_bytes,
+        current: actual_dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string(),
+    });
 
     if mode == TransferMode::Move {
         fs::remove_file(source).map_err(|e| e.to_string())?;
@@ -489,11 +534,26 @@ fn copy_file_with_progress(
     }
 
     let total = source.metadata().map_err(|e| e.to_string())?.len();
-    let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
-    let mut output = fs::File::create(dest).map_err(|e| e.to_string())?;
+    if total <= SMALL_FILE_FAST_COPY_BYTES {
+        let copied = fs::copy(source, dest).map_err(|e| e.to_string())?;
+        return Ok(copied);
+    }
 
-    let mut buffer = [0u8; 64 * 1024];
+    let input = fs::File::open(source).map_err(|e| e.to_string())?;
+    let output = fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut input = BufReader::with_capacity(1024 * 1024, input);
+    let mut output = BufWriter::with_capacity(1024 * 1024, output);
+
+    let mut buffer = vec![0u8; 4 * 1024 * 1024];
     let mut copied = 0u64;
+    let mut last_emit = Instant::now();
+    let emit_interval = Duration::from_millis(60);
+    let label = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+
     loop {
         let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
@@ -501,16 +561,19 @@ fn copy_file_with_progress(
         }
         output.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
         copied += read as u64;
-        let _ = event_tx.send(TransferEvent::Progress {
-            done_files,
-            done_bytes: *done_bytes + copied,
-            current: source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_string(),
-        });
+
+        let should_emit = last_emit.elapsed() >= emit_interval || copied == total;
+        if should_emit {
+            let _ = event_tx.send(TransferEvent::Progress {
+                done_files,
+                done_bytes: *done_bytes + copied,
+                current: label.clone(),
+            });
+            last_emit = Instant::now();
+        }
     }
+
+    output.flush().map_err(|e| e.to_string())?;
 
     Ok(total)
 }

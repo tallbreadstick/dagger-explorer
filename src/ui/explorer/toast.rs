@@ -4,6 +4,8 @@ use crate::explorer::{ConflictChoice, ExplorerState, TransferManager};
 use crate::ui::theme;
 
 pub fn show(ctx: &egui::Context, state: &mut ExplorerState) {
+    show_quick_toast(ctx, state);
+
     if state.transfer.has_conflict() {
         show_conflict_dialog(ctx, state);
     } else if state.transfer.is_active() || state.transfer.progress.error.is_some() {
@@ -11,11 +13,58 @@ pub fn show(ctx: &egui::Context, state: &mut ExplorerState) {
     }
 }
 
+fn show_quick_toast(ctx: &egui::Context, state: &mut ExplorerState) {
+    let now = ctx.input(|input| input.time);
+    let mut message = None;
+    if let Some(toast) = state.quick_toast.as_mut() {
+        if !toast.expires_at.is_finite() {
+            toast.expires_at = now + 2.0;
+        }
+        if now >= toast.expires_at {
+            state.quick_toast = None;
+        } else {
+            message = Some(toast.message.clone());
+        }
+    }
+
+    let Some(message) = message else {
+        return;
+    };
+
+    let screen = ctx.content_rect();
+    let width = 280.0;
+    let height = 44.0;
+    let margin = 16.0;
+    let offset = 90.0;
+
+    Area::new(Id::new("quick_clipboard_toast"))
+        .order(Order::Foreground)
+        .fixed_pos(egui::pos2(
+            screen.right() - width - margin,
+            screen.bottom() - height - margin - offset,
+        ))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(theme::title_bar_fill())
+                .stroke(egui::Stroke::new(1.0, theme::glass_stroke()))
+                .inner_margin(10.0)
+                .corner_radius(8.0)
+                .show(ui, |ui| {
+                    ui.set_width(width - 20.0);
+                    ui.label(
+                        egui::RichText::new(message)
+                            .size(12.0)
+                            .color(theme::text_primary()),
+                    );
+                });
+        });
+}
+
 fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
     let has_error = transfer.progress.error.is_some();
     let screen = ctx.content_rect();
     let width = 320.0;
-    let height = if has_error { 72.0 } else { 88.0 };
+    let height = if has_error { 72.0 } else { 80.0 };
     let margin = 16.0;
 
     Area::new(Id::new("transfer_toast"))
@@ -46,10 +95,12 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                         return;
                     }
 
-                    let action = if transfer.progress.label.is_empty() {
+                    let action = if transfer.progress.counting {
+                        "Counting total size…".to_string()
+                    } else if transfer.progress.operation.is_empty() {
                         "Transferring".to_string()
                     } else {
-                        transfer.progress.label.clone()
+                        transfer.progress.operation.clone()
                     };
                     ui.label(
                         egui::RichText::new(action)
@@ -70,11 +121,20 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                     };
                     let fraction = file_fraction.max(byte_fraction).clamp(0.0, 1.0);
 
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_width(width - 24.0)
-                            .fill(theme::selection_fill()),
-                    );
+                    let bar_width = width - 24.0;
+                    let bar_height = 4.0;
+                    let (bar_rect, _) =
+                        ui.allocate_exact_size(vec2(bar_width, bar_height), egui::Sense::hover());
+                    ui.painter().rect_filled(bar_rect, 2.0, theme::glass_stroke());
+                    if fraction > 0.0 {
+                        let fill_rect = egui::Rect::from_min_size(
+                            bar_rect.min,
+                            vec2(bar_rect.width() * fraction, bar_rect.height()),
+                        );
+                        ui.painter()
+                            .rect_filled(fill_rect, 2.0, theme::selection_fill());
+                    }
+                    ui.add_space(2.0);
 
                     ui.label(
                         egui::RichText::new(format!(
@@ -104,7 +164,7 @@ fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {
 
     let screen = ctx.content_rect();
     let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120);
-    ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("conflict_dim")))
+    ctx.layer_painter(LayerId::new(Order::Middle, Id::new("conflict_dim")))
         .rect_filled(screen, 0.0, dim);
 
     let size = vec2(420.0, 220.0);
@@ -115,7 +175,7 @@ fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {
         .fixed_pos(pos)
         .show(ctx, |ui| {
             Frame::new()
-                .fill(theme::title_bar_fill())
+                .fill(egui::Color32::from_rgba_unmultiplied(16, 18, 26, 245))
                 .stroke(egui::Stroke::new(1.0, theme::glass_stroke()))
                 .inner_margin(16.0)
                 .corner_radius(10.0)

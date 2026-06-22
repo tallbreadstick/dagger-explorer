@@ -65,9 +65,11 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                                 state.paste_clipboard();
                             }
                             if icon_button(ui, ICON_RENAME, "Rename", has_selection).clicked() {
-                                start_rename_from_selection(state);
+                                state.start_rename_from_selection();
                             }
-                            if icon_button(ui, ICON_DELETE, "Delete", has_selection).clicked() {}
+                            if icon_button(ui, ICON_DELETE, "Delete", has_selection).clicked() {
+                                state.trash_selection();
+                            }
 
                             toolbar_divider(ui);
 
@@ -126,32 +128,6 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                 },
             );
         });
-}
-
-fn start_rename_from_selection(state: &mut ExplorerState) {
-    if state.view_options.selected.len() != 1 {
-        return;
-    }
-
-    let path = state.view_options.selected[0].clone();
-    let parent = state.active_path();
-    let text = state
-        .fs_cache
-        .listing(&parent)
-        .and_then(|listing| {
-            listing
-                .iter()
-                .find(|entry| entry.path == path)
-                .map(|entry| entry.name.clone())
-        })
-        .unwrap_or_else(|| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_string()
-        });
-
-    state.view_options.start_rename(path, text);
 }
 
 fn sort_menu(ui: &mut Ui, state: &mut ExplorerState) {
@@ -246,16 +222,20 @@ fn view_menu(ui: &mut Ui, state: &mut ExplorerState) {
             view_mode_option(ui, state, ViewMode::SmallList, "Small list");
             view_mode_option(ui, state, ViewMode::LargeList, "Large list");
             ui.separator();
-            toggle_option(
+            if preference_checkbox(
                 ui,
                 &mut state.view_options.show_hidden_files,
                 "Hidden files",
-            );
-            toggle_option(
+            ) {
+                state.save_preferences();
+            }
+            if preference_checkbox(
                 ui,
                 &mut state.view_options.show_file_extensions,
                 "File extensions",
-            );
+            ) {
+                state.save_preferences();
+            }
         })
         .0
         .on_hover_text("View options");
@@ -270,21 +250,23 @@ fn view_mode_option(ui: &mut Ui, state: &mut ExplorerState, mode: ViewMode, labe
         .clicked()
     {
         state.view_options.view_mode = mode;
+        state.save_preferences();
         ui.close();
     }
 }
 
-fn toggle_option(ui: &mut Ui, value: &mut bool, label: &str) {
+fn preference_checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> bool {
     let mut enabled = *value;
-    if ui
+    let changed = ui
         .checkbox(
             &mut enabled,
             egui::RichText::new(label).size(12.0).color(theme::text_primary()),
         )
-        .changed()
-    {
+        .changed();
+    if changed {
         *value = enabled;
     }
+    changed
 }
 
 fn view_mode_toggle(
@@ -324,6 +306,7 @@ fn view_mode_toggle(
         .clicked()
     {
         state.view_options.view_mode = mode;
+        state.save_preferences();
     }
 }
 

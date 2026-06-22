@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
-use eframe::egui::{self, ScrollArea, Ui, vec2};
+use eframe::egui::{self, EventFilter, Key, Popup, PopupKind, ScrollArea, Sense, Ui, vec2};
 
-use crate::explorer::{ExplorerState, path_components};
+use crate::explorer::{
+    ExplorerState, apply_path_completion, list_directory_completions, path_completion_context,
+    path_components,
+};
 use crate::ui::{theme, text};
 
 pub const NAV_HEIGHT: f32 = 36.0;
@@ -10,6 +13,19 @@ const BTN_SIZE: f32 = 28.0;
 const BREADCRUMB_MENU_WIDTH: f32 = 240.0;
 const MENU_ITEM_HEIGHT: f32 = 24.0;
 const MAX_MENU_ITEMS: usize = 10;
+const PATH_AUTOCOMPLETE_WIDTH: f32 = 360.0;
+
+enum PathBarEditAction {
+    None,
+    Cancel,
+    Commit,
+}
+
+fn menu_viewport_height(ui: &Ui, visible_items: usize) -> f32 {
+    let visible_items = visible_items.min(MAX_MENU_ITEMS);
+    let spacing = ui.spacing().item_spacing.y;
+    MENU_ITEM_HEIGHT * visible_items as f32 + spacing * visible_items.saturating_sub(1) as f32
+}
 
 pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
     let can_back = state.active_tab().can_go_back();
@@ -72,23 +88,42 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                             ui.set_min_width(frame_width);
                             ui.set_max_width(frame_width);
 
-                            ScrollArea::horizontal()
-                                .id_salt("breadcrumb_scroll")
-                                .auto_shrink([false, false])
-                                .scroll_bar_visibility(
-                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                )
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 2.0;
-                                        breadcrumb(
-                                            ui,
-                                            state,
-                                            &current_path,
-                                            frame_width,
-                                        );
+                            if state.path_bar_edit.is_some() {
+                                match path_bar_editor(ui, state, frame_width) {
+                                    PathBarEditAction::Cancel => state.cancel_path_bar_edit(),
+                                    PathBarEditAction::Commit => state.commit_path_bar_edit(),
+                                    PathBarEditAction::None => {}
+                                }
+                            } else {
+                                ScrollArea::horizontal()
+                                    .id_salt("breadcrumb_scroll")
+                                    .auto_shrink([false, false])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            breadcrumb(
+                                                ui,
+                                                state,
+                                                &current_path,
+                                                frame_width,
+                                            );
+
+                                            let remaining = ui.available_width();
+                                            if remaining > 1.0 {
+                                                let (_, response) = ui.allocate_exact_size(
+                                                    vec2(remaining, ui.available_height()),
+                                                    Sense::click(),
+                                                );
+                                                if response.double_clicked() {
+                                                    state.start_path_bar_edit();
+                                                }
+                                            }
+                                        });
                                     });
-                                });
+                            }
                         });
                 });
 
@@ -117,6 +152,167 @@ fn nav_button(ui: &mut Ui, label: &str, tooltip: &str, enabled: bool) -> egui::R
         .min_size(vec2(BTN_SIZE, BTN_SIZE)),
     )
     .on_hover_text(tooltip)
+}
+
+fn move_text_edit_cursor_to_end(ctx: &egui::Context, id: egui::Id, text: &str) {
+    use egui::text::{CCursor, CCursorRange};
+
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let end = CCursor::new(text.chars().count());
+        state.cursor.set_char_range(Some(CCursorRange::one(end)));
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+}
+
+fn path_bar_editor(
+    ui: &mut Ui,
+    state: &mut ExplorerState,
+    width: f32,
+) -> PathBarEditAction {
+    let mut action = PathBarEditAction::None;
+    let edit = state.path_bar_edit.as_mut().expect("path_bar_edit");
+
+    let text_before = edit.text.clone();
+    let (parent, prefix) = path_completion_context(&edit.text);
+    let completions = list_directory_completions(&parent, &prefix);
+    if edit.completion_index >= completions.len() {
+        edit.completion_index = 0;
+    }
+
+    let text_edit_id = ui.id().with("path_bar_edit");
+    let output = egui::TextEdit::singleline(&mut edit.text)
+        .id(text_edit_id)
+        .font(egui::FontId::proportional(12.0))
+        .desired_width(width)
+        .margin(egui::Margin::ZERO)
+        .lock_focus(true)
+        .show(ui);
+    let response = &output.response;
+    response.request_focus();
+
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            response.id,
+            EventFilter {
+                tab: true,
+                vertical_arrows: !completions.is_empty(),
+                ..Default::default()
+            },
+        );
+    });
+
+    if edit.text != text_before {
+        edit.completion_index = 0;
+    }
+
+    let mut move_cursor_to_end = false;
+
+    if response.has_focus() {
+        if ui.input(|input| input.key_pressed(Key::Escape)) {
+            return PathBarEditAction::Cancel;
+        }
+        if ui.input(|input| input.key_pressed(Key::Enter)) {
+            return PathBarEditAction::Commit;
+        }
+        if ui.input(|input| input.key_pressed(Key::Tab)) {
+            if !completions.is_empty() {
+                let index = edit.completion_index % completions.len();
+                apply_path_completion(&mut edit.text, &completions[index]);
+                edit.completion_index = (index + 1) % completions.len();
+                move_cursor_to_end = true;
+            }
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Tab));
+        }
+        if !completions.is_empty() {
+            if ui.input(|input| input.key_pressed(Key::ArrowDown)) {
+                edit.completion_index = (edit.completion_index + 1) % completions.len();
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, Key::ArrowDown)
+                });
+            } else if ui.input(|input| input.key_pressed(Key::ArrowUp)) {
+                edit.completion_index = edit.completion_index.checked_sub(1).unwrap_or(
+                    completions.len().saturating_sub(1),
+                );
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+            }
+        }
+    }
+
+    let mut completion_clicked = false;
+    if !completions.is_empty() {
+        let selected = edit.completion_index;
+        let popup_width = width.max(PATH_AUTOCOMPLETE_WIDTH);
+        Popup::from_response(response)
+            .kind(PopupKind::Menu)
+            .width(popup_width)
+            .show(|ui| {
+                ui.set_min_width(popup_width);
+                ui.set_max_width(popup_width);
+
+                if completions.len() <= MAX_MENU_ITEMS {
+                    for (index, path) in completions.iter().enumerate() {
+                        if completion_menu_item(ui, path, index == selected).clicked() {
+                            apply_path_completion(
+                                &mut state.path_bar_edit.as_mut().unwrap().text,
+                                path,
+                            );
+                            state.path_bar_edit.as_mut().unwrap().completion_index = index;
+                            completion_clicked = true;
+                        }
+                    }
+                } else {
+                    let scroll_height = menu_viewport_height(ui, MAX_MENU_ITEMS);
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(scroll_height)
+                        .max_height(scroll_height)
+                        .show(ui, |ui| {
+                            for (index, path) in completions.iter().enumerate() {
+                                if completion_menu_item(ui, path, index == selected).clicked() {
+                                    apply_path_completion(
+                                        &mut state.path_bar_edit.as_mut().unwrap().text,
+                                        path,
+                                    );
+                                    state.path_bar_edit.as_mut().unwrap().completion_index = index;
+                                    completion_clicked = true;
+                                }
+                            }
+                        });
+                }
+            });
+    }
+
+    if move_cursor_to_end || completion_clicked {
+        let text = state.path_bar_edit.as_ref().unwrap().text.clone();
+        move_text_edit_cursor_to_end(ui.ctx(), text_edit_id, &text);
+    }
+
+    if completion_clicked {
+        response.request_focus();
+        return PathBarEditAction::None;
+    }
+
+    if response.lost_focus() && !Popup::is_any_open(ui.ctx()) {
+        action = PathBarEditAction::Commit;
+    }
+
+    action
+}
+
+fn completion_menu_item(ui: &mut Ui, path: &PathBuf, selected: bool) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(path.display().to_string())
+                .size(12.0)
+                .color(if selected {
+                    theme::text_primary()
+                } else {
+                    theme::text_muted()
+                }),
+        )
+        .frame(false)
+        .min_size(vec2(ui.available_width(), MENU_ITEM_HEIGHT)),
+    )
 }
 
 fn breadcrumb(
@@ -204,7 +400,11 @@ fn folder_submenu(ui: &mut Ui, state: &mut ExplorerState, parent_path: &PathBuf)
     let font_id = egui::FontId::proportional(12.0);
 
     if let Some(listing) = state.fs_cache.listing(parent_path) {
-        let subdirs: Vec<_> = listing.iter().filter(|e| e.is_dir).collect();
+        let subdirs: Vec<_> = listing
+            .lock()
+            .ok()
+            .map(|guard| guard.entries.iter().filter(|e| e.is_dir).cloned().collect())
+            .unwrap_or_default();
         if subdirs.is_empty() {
             ui.label(
                 egui::RichText::new("No subfolders")
@@ -212,15 +412,17 @@ fn folder_submenu(ui: &mut Ui, state: &mut ExplorerState, parent_path: &PathBuf)
                     .color(theme::text_muted()),
             );
         } else if subdirs.len() <= MAX_MENU_ITEMS {
-            for entry in subdirs {
+            for entry in subdirs.iter() {
                 folder_menu_item(ui, state, entry, label_width, &font_id);
             }
         } else {
+            let scroll_height = menu_viewport_height(ui, MAX_MENU_ITEMS);
             ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .max_height(MENU_ITEM_HEIGHT * MAX_MENU_ITEMS as f32)
+                .min_scrolled_height(scroll_height)
+                .max_height(scroll_height)
                 .show(ui, |ui| {
-                    for entry in subdirs {
+                    for entry in subdirs.iter() {
                         folder_menu_item(ui, state, entry, label_width, &font_id);
                     }
                 });

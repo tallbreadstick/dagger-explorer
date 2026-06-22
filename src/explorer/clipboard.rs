@@ -99,9 +99,15 @@ fn build_payload(paths: &[PathBuf], op: ClipboardOp) -> Result<FileClipboardPayl
 }
 
 fn path_to_file_uri(path: &Path) -> Result<String, String> {
-    let abs = path
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve {}: {error}", path.display()))?;
+    let abs = path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/"))
+                .join(path)
+        }
+    });
     let encoded = percent_encode(abs.display().to_string().as_bytes());
     Ok(format!("file://{encoded}"))
 }
@@ -189,6 +195,31 @@ fn parse_kde_cut(data: &[u8]) -> ClipboardOp {
         ClipboardOp::Move
     } else {
         ClipboardOp::Copy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn build_payload_from_tmp() {
+        let paths = vec![PathBuf::from("/tmp")];
+        let payload = build_payload(&paths, ClipboardOp::Copy).expect("payload");
+        assert!(payload.uri_list.starts_with(b"file://"));
+        assert!(payload.gnome.starts_with(b"copy"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_and_get_system_clipboard() {
+        let paths = vec![PathBuf::from("/tmp")];
+        set_system_clipboard(paths, ClipboardOp::Copy).expect("set clipboard");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (got, op) = get_system_clipboard().expect("get clipboard");
+        assert!(!got.is_empty());
+        assert_eq!(op, ClipboardOp::Copy);
     }
 }
 
@@ -441,8 +472,9 @@ mod linux {
                 });
             }
 
-            Options::new()
-                .copy_multi(sources)
+            let mut opts = Options::new();
+            opts.omit_additional_text_mime_types(true);
+            opts.copy_multi(sources)
                 .map_err(|error| format!("Wayland clipboard write failed: {error}"))
         }
 

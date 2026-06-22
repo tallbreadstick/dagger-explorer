@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use jwalk::WalkDir;
-use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct FileEntry {
@@ -82,40 +81,54 @@ fn format_byte_size(size: u64) -> String {
     }
 }
 
-pub fn list_directory(path: &Path) -> Vec<FileEntry> {
-    let mut entries: Vec<FileEntry> = WalkDir::new(path)
-        .min_depth(1)
-        .max_depth(1)
-        .sort(true)
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let file_type = entry.file_type();
-            let name = path.file_name()?.to_str()?.to_string();
-            let metadata = entry.metadata().ok()?;
-            let modified = metadata.modified().ok()?;
-            let size = if file_type.is_dir() { 0 } else { metadata.len() };
-            let is_hidden = is_hidden_entry(&name, &metadata);
-
-            Some(FileEntry {
-                name,
-                path: path.to_path_buf(),
-                is_dir: file_type.is_dir(),
-                size,
-                modified,
-                is_hidden,
-            })
-        })
-        .collect();
-
+fn sort_entries(entries: &mut [FileEntry]) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries
+}
+
+enum ListingEvent {
+    Entry(FileEntry),
+    Complete,
+}
+
+fn stream_directory(path: &Path, tx: mpsc::Sender<ListingEvent>) {
+    for entry in WalkDir::new(path)
+        .min_depth(1)
+        .max_depth(1)
+        .sort(true)
+        .into_iter()
+        .flatten()
+    {
+        let entry_path = entry.path();
+        let file_type = entry.file_type();
+        let name = match entry_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(_) => continue,
+        };
+        let size = if file_type.is_dir() { 0 } else { metadata.len() };
+        let is_hidden = is_hidden_entry(&name, &metadata);
+
+        let _ = tx.send(ListingEvent::Entry(FileEntry {
+            name,
+            path: entry_path.to_path_buf(),
+            is_dir: file_type.is_dir(),
+            size,
+            modified,
+            is_hidden,
+        }));
+    }
+    let _ = tx.send(ListingEvent::Complete);
 }
 
 fn is_hidden_entry(name: &str, metadata: &std::fs::Metadata) -> bool {
@@ -135,6 +148,23 @@ fn is_hidden_entry(name: &str, metadata: &std::fs::Metadata) -> bool {
         false
     }
 }
+
+#[derive(Debug)]
+pub struct DirectoryListing {
+    pub entries: Vec<FileEntry>,
+    pub complete: bool,
+}
+
+impl DirectoryListing {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            complete: false,
+        }
+    }
+}
+
+pub type SharedListing = Arc<Mutex<DirectoryListing>>;
 
 pub fn open_path(path: &Path) {
     #[cfg(target_os = "linux")]
@@ -159,8 +189,8 @@ pub fn open_path(path: &Path) {
 }
 
 pub struct FsCache {
-    listings: std::collections::HashMap<PathBuf, Arc<Vec<FileEntry>>>,
-    pending: Vec<(PathBuf, Receiver<Vec<FileEntry>>)>,
+    listings: std::collections::HashMap<PathBuf, SharedListing>,
+    pending: Vec<(PathBuf, Receiver<ListingEvent>)>,
 }
 
 impl FsCache {
@@ -171,42 +201,95 @@ impl FsCache {
         }
     }
 
-    pub fn listing(&self, path: &Path) -> Option<Arc<Vec<FileEntry>>> {
+    pub fn listing(&self, path: &Path) -> Option<SharedListing> {
         self.listings.get(path).cloned()
     }
 
+    pub fn is_listing_loading(&self, path: &Path) -> bool {
+        if self.pending.iter().any(|(pending, _)| pending == path) {
+            return true;
+        }
+
+        self.listings
+            .get(path)
+            .and_then(|listing| listing.lock().ok())
+            .is_some_and(|guard| !guard.complete)
+    }
+
+    /// Soft progress while entries stream in; `1.0` once complete.
+    pub fn listing_progress(&self, path: &Path) -> Option<f32> {
+        let listing = self.listings.get(path)?;
+        let guard = listing.lock().ok()?;
+        if guard.complete {
+            return Some(1.0);
+        }
+        if guard.entries.is_empty() {
+            return Some(0.05);
+        }
+        Some(1.0 - (-(guard.entries.len() as f32) / 80.0).exp())
+    }
+
     pub fn request_listing(&mut self, path: PathBuf) {
-        if self.listings.contains_key(&path) {
-            return;
+        if let Some(listing) = self.listings.get(&path) {
+            if let Ok(guard) = listing.lock() {
+                if guard.complete {
+                    return;
+                }
+            }
         }
         if self.pending.iter().any(|(p, _)| p == &path) {
             return;
         }
 
+        let shared = Arc::new(Mutex::new(DirectoryListing::new()));
+        self.listings.insert(path.clone(), Arc::clone(&shared));
+
         let (tx, rx) = mpsc::channel();
         let path_for_thread = path.clone();
-        std::thread::spawn(move || {
-            let entries = list_directory(&path_for_thread);
-            let _ = tx.send(entries);
-        });
+        std::thread::spawn(move || stream_directory(&path_for_thread, tx));
         self.pending.push((path, rx));
     }
 
     pub fn invalidate(&mut self, path: &Path) {
         self.listings.remove(path);
+        self.pending.retain(|(pending, _)| pending != path);
     }
 
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         self.pending.retain_mut(|(path, rx)| {
-            match rx.try_recv() {
-                Ok(entries) => {
-                    self.listings.insert(path.clone(), Arc::new(entries));
-                    changed = true;
-                    false
+            loop {
+                match rx.try_recv() {
+                    Ok(ListingEvent::Entry(entry)) => {
+                        if let Some(listing) = self.listings.get(path) {
+                            if let Ok(mut guard) = listing.lock() {
+                                guard.entries.push(entry);
+                            }
+                        }
+                        changed = true;
+                    }
+                    Ok(ListingEvent::Complete) => {
+                        if let Some(listing) = self.listings.get(path) {
+                            if let Ok(mut guard) = listing.lock() {
+                                sort_entries(&mut guard.entries);
+                                guard.complete = true;
+                            }
+                        }
+                        changed = true;
+                        return false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return true,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if let Some(listing) = self.listings.get(path) {
+                            if let Ok(mut guard) = listing.lock() {
+                                sort_entries(&mut guard.entries);
+                                guard.complete = true;
+                            }
+                        }
+                        changed = true;
+                        return false;
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => true,
-                Err(mpsc::TryRecvError::Disconnected) => false,
             }
         });
         changed

@@ -10,9 +10,16 @@ pub fn show(ui: &mut Ui, state: &ExplorerState) {
     let selected_count = state.view_options.selected.len();
 
     let (total_count, selected_bytes) = if let Some(listing) = state.fs_cache.listing(&path) {
-        let entries = prepare_entries(listing.as_ref(), &state.view_options);
+        let guard = listing.lock().ok();
+        let entries = guard
+            .as_ref()
+            .map(|guard| prepare_entries(&guard.entries, &state.view_options))
+            .unwrap_or_default();
+        let raw_entries = guard
+            .map(|guard| guard.entries.clone())
+            .unwrap_or_default();
         let total = entries.len();
-        let bytes = selected_bytes_from_listing(listing.as_ref(), &state.view_options.selected);
+        let bytes = selected_bytes_from_listing(&raw_entries, &state.view_options.selected);
         (total, bytes)
     } else {
         (0, 0)

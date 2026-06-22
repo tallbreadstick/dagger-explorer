@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Rect, ScrollArea, Ui, UiBuilder, vec2};
 
-use crate::explorer::{ExplorerState, QuickAccessEntry, list_drives, open_path, quick_access_entries};
+use crate::explorer::{ExplorerState, QuickAccessEntry, list_drives, quick_access_entries};
 use crate::ui::{theme, text};
 
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -10,6 +10,7 @@ const SECTION_HEADER_HEIGHT: f32 = 14.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const ITEM_GAP: f32 = 4.0;
 const BETWEEN_SECTIONS: f32 = 12.0;
+const BOTTOM_PADDING: f32 = 8.0;
 
 pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
     egui::Panel::left("explorer_sidebar")
@@ -66,6 +67,7 @@ fn bottom_sections_height(quick_access_count: usize, drives_count: usize) -> f32
     let mut height = BETWEEN_SECTIONS + 1.0 + 8.0; // separator block
     height += SECTION_HEADER_HEIGHT + ITEM_GAP + rows(quick_access_count) + BETWEEN_SECTIONS;
     height += SECTION_HEADER_HEIGHT + ITEM_GAP + rows(drives_count);
+    height += BOTTOM_PADDING;
     height
 }
 
@@ -96,6 +98,7 @@ fn show_bottom_sections(
             state.navigate_active(drive.clone());
         }
     }
+    ui.add_space(BOTTOM_PADDING);
 }
 
 fn section_header(ui: &mut Ui, title: &str) {
@@ -206,15 +209,12 @@ fn show_tree_node(ui: &mut Ui, state: &mut ExplorerState, node_path: &PathBuf, d
         );
 
         let clicked_path = node_path.clone();
-        if response.clicked() && is_dir {
+        if response.double_clicked() && is_dir {
+            state.cancel_tree_click();
             state.toggle_tree_expand(&clicked_path);
-        }
-        if response.double_clicked() {
-            if is_dir {
-                state.navigate_active(clicked_path);
-            } else {
-                open_path(&clicked_path);
-            }
+        } else if response.clicked() {
+            let at = ui.input(|input| input.time);
+            state.schedule_tree_click(clicked_path, is_dir, at);
         }
     });
 
@@ -228,7 +228,12 @@ fn show_tree_node(ui: &mut Ui, state: &mut ExplorerState, node_path: &PathBuf, d
             let file_count = state
                 .fs_cache
                 .listing(node_path)
-                .map(|listing| listing.iter().filter(|entry| !entry.is_dir).count())
+                .and_then(|listing| {
+                    listing
+                        .lock()
+                        .ok()
+                        .map(|guard| guard.entries.iter().filter(|entry| !entry.is_dir).count())
+                })
                 .unwrap_or(0);
 
             if file_count > 0 {

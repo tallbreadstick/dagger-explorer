@@ -1,2 +1,4 @@
 /target
 /result
+/assets/ffmpeg/**/ffmpeg
+/assets/ffmpeg/**/ffmpeg.exe
