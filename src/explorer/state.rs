@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
@@ -11,7 +11,7 @@ use super::directory_loading::DirectoryLoadingBar;
 use super::fs::{FsCache, open_path, read_file_entry, sort_cached_entries};
 use super::format::format_size_kb;
 use super::paths::home_dir;
-use super::preferences::Preferences;
+use super::preferences::{IconColorPreference, Preferences};
 use super::tab::ExplorerTab;
 use super::thumbs::ThumbnailRuntime;
 use super::transfer::{TransferManager, TransferMode};
@@ -109,6 +109,8 @@ pub struct ExplorerState {
     pub quick_toast: Option<QuickToast>,
     pub properties_dialog: Option<PropertiesDialog>,
     properties_result_rx: Option<Receiver<PropertiesDialog>>,
+    icon_colors: HashMap<PathBuf, egui::Color32>,
+    pub icon_color_dialog_open: bool,
     prepared_entries_cache: Option<PreparedEntriesCache>,
     fs_notify_watcher: Option<RecommendedWatcher>,
     fs_notify_rx: Option<Receiver<notify::Result<Event>>>,
@@ -166,6 +168,8 @@ impl ExplorerState {
             quick_toast: None,
             properties_dialog: None,
             properties_result_rx: None,
+            icon_colors: load_icon_colors(&preferences),
+            icon_color_dialog_open: false,
             prepared_entries_cache: None,
             fs_notify_watcher: None,
             fs_notify_rx: None,
@@ -176,7 +180,15 @@ impl ExplorerState {
     }
 
     pub fn save_preferences(&self) {
-        let preferences = Preferences::from_view_options(&self.view_options);
+        let mut preferences = Preferences::from_view_options(&self.view_options);
+        preferences.icon_colors = self
+            .icon_colors
+            .iter()
+            .map(|(path, color)| IconColorPreference {
+                path: path.clone(),
+                rgba: [color.r(), color.g(), color.b(), color.a()],
+            })
+            .collect();
         if let Err(error) = preferences.save() {
             eprintln!("[dagger-explorer] failed to save preferences: {error}");
         }
@@ -615,6 +627,42 @@ impl ExplorerState {
         self.open_selection();
     }
 
+    pub fn icon_color_for(&self, path: &Path) -> Option<egui::Color32> {
+        self.icon_colors.get(path).copied()
+    }
+
+    pub fn selected_icon_color_or_default(&self, default: egui::Color32) -> egui::Color32 {
+        self.view_options
+            .selected
+            .first()
+            .and_then(|path| self.icon_colors.get(path).copied())
+            .unwrap_or(default)
+    }
+
+    pub fn set_icon_color_for_selection(&mut self, color: egui::Color32) {
+        for path in &self.view_options.selected {
+            self.icon_colors.insert(path.clone(), color);
+        }
+        self.save_preferences();
+    }
+
+    pub fn reset_icon_color_for_selection(&mut self) {
+        for path in &self.view_options.selected {
+            self.icon_colors.remove(path);
+        }
+        self.save_preferences();
+    }
+
+    pub fn open_icon_color_dialog(&mut self) {
+        if !self.view_options.selected.is_empty() {
+            self.icon_color_dialog_open = true;
+        }
+    }
+
+    pub fn close_icon_color_dialog(&mut self) {
+        self.icon_color_dialog_open = false;
+    }
+
     pub fn copy_selection_as_paths(&mut self, ctx: &egui::Context) {
         if self.view_options.selected.is_empty() {
             return;
@@ -744,11 +792,18 @@ impl ExplorerState {
     }
 
     fn invalidate_after_delete(&mut self, paths: &[PathBuf]) {
+        let mut colors_changed = false;
         let mut parents = HashSet::new();
         for path in paths {
+            if self.icon_colors.remove(path).is_some() {
+                colors_changed = true;
+            }
             if let Some(parent) = path.parent() {
                 parents.insert(parent.to_path_buf());
             }
+        }
+        if colors_changed {
+            self.save_preferences();
         }
         for parent in parents {
             self.fs_cache.invalidate(&parent);
@@ -1170,6 +1225,11 @@ impl ExplorerState {
             }
         }
 
+        if let Some(color) = self.icon_colors.remove(&rename.path) {
+            self.icon_colors.insert(new_path, color);
+            self.save_preferences();
+        }
+
         true
     }
 
@@ -1427,6 +1487,24 @@ fn open_terminal_at_path(path: &Path) -> bool {
         let _ = path;
         false
     }
+}
+
+fn load_icon_colors(preferences: &Preferences) -> HashMap<PathBuf, egui::Color32> {
+    preferences
+        .icon_colors
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                egui::Color32::from_rgba_unmultiplied(
+                    entry.rgba[0],
+                    entry.rgba[1],
+                    entry.rgba[2],
+                    entry.rgba[3],
+                ),
+            )
+        })
+        .collect()
 }
 
 fn build_properties_loading(paths: &[PathBuf], active_location: &str) -> PropertiesDialog {

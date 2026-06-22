@@ -614,6 +614,7 @@ fn icon_tile(
     } else {
         theme::text_primary()
     };
+    let icon_color = state.icon_color_for(&path).unwrap_or(text_color);
 
     let (rect, response) = ui.allocate_exact_size(
         vec2(metrics.tile_width, metrics.tile_height),
@@ -628,7 +629,7 @@ fn icon_tile(
         entry,
         metrics.tile_icon_center(rect),
         metrics.icon_max_side(),
-        text_color,
+        icon_color,
     );
 
     let label_rect = egui::Rect::from_center_size(
@@ -679,6 +680,7 @@ fn list_row(
     } else {
         theme::text_primary()
     };
+    let icon_color = state.icon_color_for(&path).unwrap_or(primary);
     let muted = if selected {
         Color32::from_rgba_unmultiplied(230, 235, 245, 200)
     } else {
@@ -697,7 +699,7 @@ fn list_row(
         rect.min.x + LIST_ICON_COLUMN_PADDING * 0.5 + icon_side * 0.5,
         rect.center().y,
     );
-    paint_file_icon(ui, state, entry, icon_center, icon_side, primary);
+    paint_file_icon(ui, state, entry, icon_center, icon_side, icon_color);
 
     let name_rect = cell_rect(rect, cols.name_start(rect.min.x), cols.name_end(rect.min.x));
     if renaming {
@@ -957,6 +959,7 @@ fn show_selection_context_menu(ui: &mut Ui, state: &mut ExplorerState) {
         state.start_rename_from_selection();
     });
     context_menu_action(ui, "Move to Trash", has_selection, || state.trash_selection());
+    context_menu_action(ui, "Icon Color…", has_selection, || state.open_icon_color_dialog());
     ui.separator();
     context_menu_action(ui, "Properties", has_selection, || {
         state.show_properties_for_selection();

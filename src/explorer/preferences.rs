@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,14 @@ pub struct Preferences {
     pub show_hidden_files: bool,
     #[serde(default = "default_show_extensions")]
     pub show_file_extensions: bool,
+    #[serde(default)]
+    pub icon_colors: Vec<IconColorPreference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IconColorPreference {
+    pub path: PathBuf,
+    pub rgba: [u8; 4],
 }
 
 fn default_show_extensions() -> bool {
@@ -26,6 +35,7 @@ impl Default for Preferences {
             view_mode: ViewMode::default(),
             show_hidden_files: false,
             show_file_extensions: true,
+            icon_colors: Vec::new(),
         }
     }
 }
@@ -59,6 +69,7 @@ impl Preferences {
             view_mode: options.view_mode,
             show_hidden_files: options.show_hidden_files,
             show_file_extensions: options.show_file_extensions,
+            icon_colors: Vec::new(),
         }
     }
 }

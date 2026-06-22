@@ -17,6 +17,10 @@ pub fn show(ctx: &egui::Context, state: &mut ExplorerState) {
     if state.properties_dialog.is_some() {
         show_properties_window(ctx, state);
     }
+
+    if state.icon_color_dialog_open {
+        show_icon_color_window(ctx, state);
+    }
 }
 
 fn show_quick_toast(ctx: &egui::Context, state: &mut ExplorerState) {
@@ -365,5 +369,106 @@ fn show_properties_window(ctx: &egui::Context, state: &mut ExplorerState) {
                     state.close_properties_dialog();
                 }
             });
+    });
+}
+
+fn show_icon_color_window(ctx: &egui::Context, state: &mut ExplorerState) {
+    if state.view_options.selected.is_empty() {
+        state.close_icon_color_dialog();
+        return;
+    }
+
+    let viewport_id = ViewportId::from_hash_of("icon_color_window");
+    let builder = ViewportBuilder::default()
+        .with_title("Icon Color")
+        .with_inner_size(vec2(360.0, 178.0))
+        .with_transparent(false)
+        .with_resizable(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false);
+    ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::Transparent(false));
+
+        if ui.input(|input| input.viewport().close_requested())
+            || ui.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            state.close_icon_color_dialog();
+            return;
+        }
+
+        let viewport_rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(viewport_rect, 0.0, theme::title_bar_fill());
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(viewport_rect.shrink2(vec2(12.0, 10.0))),
+            |ui| {
+                ui.label(
+                    egui::RichText::new("Icon color for selected items")
+                        .size(12.0)
+                        .color(theme::text_primary()),
+                );
+                let color = state.selected_icon_color_or_default(theme::text_primary());
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("Quick colors")
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                );
+                let presets: [(&str, egui::Color32); 12] = [
+                    ("Default", theme::text_primary()),
+                    ("Blue", egui::Color32::from_rgb(90, 160, 255)),
+                    ("Sky", egui::Color32::from_rgb(94, 214, 255)),
+                    ("Cyan", egui::Color32::from_rgb(73, 216, 200)),
+                    ("Green", egui::Color32::from_rgb(108, 212, 88)),
+                    ("Lime", egui::Color32::from_rgb(182, 224, 82)),
+                    ("Yellow", egui::Color32::from_rgb(236, 210, 84)),
+                    ("Orange", egui::Color32::from_rgb(240, 160, 70)),
+                    ("Red", egui::Color32::from_rgb(230, 92, 92)),
+                    ("Pink", egui::Color32::from_rgb(236, 120, 194)),
+                    ("Purple", egui::Color32::from_rgb(182, 112, 232)),
+                    ("Gray", egui::Color32::from_rgb(170, 170, 170)),
+                ];
+                egui::Grid::new("icon_color_presets")
+                    .num_columns(6)
+                    .spacing(vec2(8.0, 8.0))
+                    .show(ui, |ui| {
+                        for (index, (name, preset)) in presets.iter().enumerate() {
+                            let selected = color == *preset;
+                            let response = ui
+                                .add(
+                                    egui::Button::new("")
+                                        .fill(*preset)
+                                        .corner_radius(2.0)
+                                        .stroke(if selected {
+                                            egui::Stroke::new(2.0, theme::selection_stroke())
+                                        } else {
+                                            egui::Stroke::new(1.0, theme::glass_stroke())
+                                        })
+                                        .min_size(vec2(26.0, 20.0)),
+                                )
+                                .on_hover_text(*name);
+                            if response.clicked() {
+                                state.set_icon_color_for_selection(*preset);
+                            }
+                            if (index + 1) % 6 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reset to Default").clicked() {
+                        state.reset_icon_color_for_selection();
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        state.close_icon_color_dialog();
+                    }
+                });
+            },
+        );
     });
 }
