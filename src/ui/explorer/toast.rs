@@ -126,7 +126,11 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                     let (bar_rect, _) =
                         ui.allocate_exact_size(vec2(bar_width, bar_height), egui::Sense::hover());
                     ui.painter().rect_filled(bar_rect, 2.0, theme::glass_stroke());
-                    if fraction > 0.0 {
+                    let show_indeterminate =
+                        transfer.progress.active && (transfer.progress.counting || fraction <= 0.0);
+                    if show_indeterminate {
+                        paint_indeterminate_bar(ui, bar_rect);
+                    } else if fraction > 0.0 {
                         let fill_rect = egui::Rect::from_min_size(
                             bar_rect.min,
                             vec2(bar_rect.width() * fraction, bar_rect.height()),
@@ -136,16 +140,40 @@ fn show_transfer_toast(ctx: &egui::Context, transfer: &mut TransferManager) {
                     }
                     ui.add_space(2.0);
 
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} / {} files",
-                            progress.done_files, progress.total_files
-                        ))
-                        .size(10.0)
-                        .color(theme::text_muted()),
-                    );
+                    if show_indeterminate {
+                        ui.label(
+                            egui::RichText::new("Working…")
+                                .size(10.0)
+                                .color(theme::text_muted()),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {} files",
+                                progress.done_files, progress.total_files
+                            ))
+                            .size(10.0)
+                            .color(theme::text_muted()),
+                        );
+                    }
                 });
         });
+}
+
+fn paint_indeterminate_bar(ui: &mut egui::Ui, rect: egui::Rect) {
+    let t = ui.input(|input| input.time) as f32;
+    let segment_width = rect.width() * 0.30;
+    let travel = rect.width() + segment_width;
+    let left = rect.left() + (t * 180.0).rem_euclid(travel) - segment_width;
+    let right = (left + segment_width).min(rect.right());
+    if right > rect.left() {
+        let segment = egui::Rect::from_min_max(
+            egui::pos2(left.max(rect.left()), rect.top()),
+            egui::pos2(right, rect.bottom()),
+        );
+        ui.painter().rect_filled(segment, 2.0, theme::selection_fill());
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
 }
 
 fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {

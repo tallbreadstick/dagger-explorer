@@ -285,6 +285,13 @@ impl ExplorerState {
             && self.transfer.progress.error.is_none()
             && self.transfer.progress.label == "Done"
         {
+            let pasted_items = self
+                .transfer
+                .progress
+                .done_files
+                .max(self.transfer.progress.total_files)
+                .max(1);
+            self.show_quick_toast(format!("Pasted {pasted_items} item(s)"));
             self.view_options.clear_selection();
             self.view_options.clipboard = None;
         }
@@ -349,7 +356,6 @@ impl ExplorerState {
         };
 
         let dest = self.active_path();
-        self.show_quick_toast(format!("Pasting {} item(s)", paths.len()));
         self.transfer.start(paths, dest, mode);
     }
 
@@ -399,9 +405,11 @@ impl ExplorerState {
         }
 
         let paths = self.view_options.selected.clone();
+        let item_count = paths.len();
         let _ = move_paths_to_trash(&paths);
         self.invalidate_after_delete(&paths);
         self.view_options.clear_selection();
+        self.show_quick_toast(format!("Deleted {item_count} item(s)"));
     }
 
     pub fn delete_selection_permanently(&mut self) {
@@ -410,9 +418,11 @@ impl ExplorerState {
         }
 
         let paths = self.view_options.selected.clone();
+        let item_count = paths.len();
         let _ = delete_paths_permanently(&paths);
         self.invalidate_after_delete(&paths);
         self.view_options.clear_selection();
+        self.show_quick_toast(format!("Deleted {item_count} item(s)"));
     }
 
     fn invalidate_after_delete(&mut self, paths: &[PathBuf]) {
