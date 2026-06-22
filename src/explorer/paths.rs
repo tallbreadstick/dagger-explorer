@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use sysinfo::Disks;
+
 #[derive(Clone, Debug)]
 pub struct QuickAccessEntry {
     pub label: String,
@@ -86,43 +88,21 @@ pub fn quick_access_entries() -> Vec<QuickAccessEntry> {
 }
 
 pub fn list_drives() -> Vec<PathBuf> {
-    if cfg!(target_os = "windows") {
-        (b'A'..=b'Z')
-            .filter_map(|letter| {
-                let path = PathBuf::from(format!("{}:\\", letter as char));
-                path.exists().then_some(path)
-            })
-            .collect()
-    } else {
-        let mut drives = vec![PathBuf::from("/")];
+    let disks = Disks::new_with_refreshed_list();
+    let mut drives: Vec<PathBuf> = disks
+        .list()
+        .iter()
+        .map(|disk| disk.mount_point().to_path_buf())
+        .filter(|path| path.exists())
+        .collect();
 
-        for base in ["/media", "/mnt", "/run/media"] {
-            let base_path = PathBuf::from(base);
-            if let Ok(read_dir) = std::fs::read_dir(&base_path) {
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if base == "/run/media" {
-                            if let Ok(user_dirs) = std::fs::read_dir(&path) {
-                                for user_entry in user_dirs.flatten() {
-                                    let mount = user_entry.path();
-                                    if mount.is_dir() {
-                                        drives.push(mount);
-                                    }
-                                }
-                            }
-                        } else {
-                            drives.push(path);
-                        }
-                    }
-                }
-            }
-        }
-
-        drives.sort();
-        drives.dedup();
-        drives
+    if cfg!(not(target_os = "windows")) && !drives.iter().any(|drive| drive == Path::new("/")) {
+        drives.push(PathBuf::from("/"));
     }
+
+    drives.sort();
+    drives.dedup();
+    drives
 }
 
 pub fn tab_display_name(path: &Path) -> String {

@@ -1,11 +1,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
+
+use jwalk::WalkDir;
 
 use super::delete::{delete_paths_permanently, move_paths_to_trash};
 use super::directory_loading::DirectoryLoadingBar;
 use super::fs::{FsCache, open_path, read_file_entry, sort_cached_entries};
+use super::format::format_size_kb;
 use super::paths::home_dir;
 use super::preferences::Preferences;
 use super::tab::ExplorerTab;
@@ -75,6 +79,16 @@ struct PendingTreeClick {
     at: f64,
 }
 
+#[derive(Clone)]
+struct PreparedEntriesCache {
+    path: PathBuf,
+    fs_revision: u64,
+    show_hidden_files: bool,
+    sort_field: super::view::SortField,
+    sort_order: super::view::SortOrder,
+    entries: Arc<Vec<super::fs::FileEntry>>,
+}
+
 pub struct ExplorerState {
     pub tabs: Vec<ExplorerTab>,
     pub active_tab: usize,
@@ -93,6 +107,9 @@ pub struct ExplorerState {
     last_clipboard_check: f64,
     pub path_bar_edit: Option<PathBarEditState>,
     pub quick_toast: Option<QuickToast>,
+    pub properties_dialog: Option<PropertiesDialog>,
+    properties_result_rx: Option<Receiver<PropertiesDialog>>,
+    prepared_entries_cache: Option<PreparedEntriesCache>,
     fs_notify_watcher: Option<RecommendedWatcher>,
     fs_notify_rx: Option<Receiver<notify::Result<Event>>>,
     fs_notify_dir: Option<PathBuf>,
@@ -109,6 +126,17 @@ pub struct PathBarEditState {
 pub struct QuickToast {
     pub message: String,
     pub expires_at: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PropertiesDialog {
+    pub title: String,
+    pub location: String,
+    pub item_count: usize,
+    pub file_count: usize,
+    pub folder_count: usize,
+    pub size_label: String,
+    pub loading: bool,
 }
 
 impl ExplorerState {
@@ -136,6 +164,9 @@ impl ExplorerState {
             last_clipboard_check: 0.0,
             path_bar_edit: None,
             quick_toast: None,
+            properties_dialog: None,
+            properties_result_rx: None,
+            prepared_entries_cache: None,
             fs_notify_watcher: None,
             fs_notify_rx: None,
             fs_notify_dir: None,
@@ -201,7 +232,52 @@ impl ExplorerState {
             // stays responsive even when there is no user input.
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+
+        if self.poll_properties_result() {
+            ctx.request_repaint();
+        }
         self.refresh_clipboard_state(ctx);
+    }
+
+    pub fn prepared_entries_for(
+        &mut self,
+        path: &Path,
+        source_entries: &[super::fs::FileEntry],
+    ) -> Arc<Vec<super::fs::FileEntry>> {
+        let fs_revision = self.fs_cache.revision();
+        let show_hidden_files = self.view_options.show_hidden_files;
+        let sort_field = self.view_options.sort_field;
+        let sort_order = self.view_options.sort_order;
+
+        let needs_refresh = self
+            .prepared_entries_cache
+            .as_ref()
+            .is_none_or(|cache| {
+                cache.path != path
+                    || cache.fs_revision != fs_revision
+                    || cache.show_hidden_files != show_hidden_files
+                    || cache.sort_field != sort_field
+                    || cache.sort_order != sort_order
+            });
+
+        if needs_refresh {
+            let entries = Arc::new(prepare_entries(source_entries, &self.view_options));
+            self.prepared_entries_cache = Some(PreparedEntriesCache {
+                path: path.to_path_buf(),
+                fs_revision,
+                show_hidden_files,
+                sort_field,
+                sort_order,
+                entries: entries.clone(),
+            });
+            return entries;
+        }
+
+        self.prepared_entries_cache
+            .as_ref()
+            .expect("prepared_entries_cache populated")
+            .entries
+            .clone()
     }
 
     fn ensure_active_dir_watch(&mut self, active_path: &Path) {
@@ -469,6 +545,143 @@ impl ExplorerState {
             message,
             expires_at: f64::INFINITY,
         });
+    }
+
+    pub fn new_file_in_active(&mut self) {
+        let dir = self.active_path();
+        let Some(path) = unique_path_in_directory(&dir, "New File", None) else {
+            self.show_quick_toast("Could not create new file".to_string());
+            return;
+        };
+
+        if std::fs::File::create(&path).is_err() {
+            self.show_quick_toast("Could not create new file".to_string());
+            return;
+        }
+
+        self.fs_cache.invalidate(&dir);
+        self.fs_cache.request_listing(dir);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("New File")
+            .to_string();
+        self.view_options.select_only(path.clone());
+        self.view_options.start_rename(path, name);
+    }
+
+    pub fn new_folder_in_active(&mut self) {
+        let dir = self.active_path();
+        let Some(path) = unique_path_in_directory(&dir, "New Folder", None) else {
+            self.show_quick_toast("Could not create new folder".to_string());
+            return;
+        };
+
+        if std::fs::create_dir(&path).is_err() {
+            self.show_quick_toast("Could not create new folder".to_string());
+            return;
+        }
+
+        self.fs_cache.invalidate(&dir);
+        self.fs_cache.request_listing(dir);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("New Folder")
+            .to_string();
+        self.view_options.select_only(path.clone());
+        self.view_options.start_rename(path, name);
+    }
+
+    pub fn open_selection(&mut self) {
+        if self.view_options.selected.is_empty() {
+            return;
+        }
+        if self.view_options.selected.len() == 1 {
+            let path = self.view_options.selected[0].clone();
+            if path.is_dir() {
+                self.navigate_active(path);
+            } else {
+                open_path(&path);
+            }
+            return;
+        }
+        for path in &self.view_options.selected {
+            open_path(path);
+        }
+    }
+
+    pub fn open_with_selection(&mut self) {
+        self.open_selection();
+    }
+
+    pub fn copy_selection_as_paths(&mut self, ctx: &egui::Context) {
+        if self.view_options.selected.is_empty() {
+            return;
+        }
+        let text = self
+            .view_options
+            .selected
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.copy_text(text);
+        self.show_quick_toast(format!(
+            "Copied {} path(s)",
+            self.view_options.selected.len()
+        ));
+    }
+
+    pub fn open_terminal_here(&mut self) {
+        let path = self.active_path();
+        let opened = open_terminal_at_path(&path);
+        if !opened {
+            self.show_quick_toast("Could not open terminal here".to_string());
+        }
+    }
+
+    pub fn show_properties_for_selection(&mut self) {
+        if self.view_options.selected.is_empty() {
+            let current = self.active_path();
+            self.show_properties_for_paths(vec![current]);
+            return;
+        }
+        self.show_properties_for_paths(self.view_options.selected.clone());
+    }
+
+    pub fn show_properties_for_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let active_location = self.active_path().display().to_string();
+        let loading = build_properties_loading(&paths, &active_location);
+        self.properties_dialog = Some(loading);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.properties_result_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = build_properties_summary(paths, active_location);
+            let _ = tx.send(result);
+        });
+    }
+
+    pub fn close_properties_dialog(&mut self) {
+        self.properties_dialog = None;
+        self.properties_result_rx = None;
+    }
+
+    fn poll_properties_result(&mut self) -> bool {
+        let Some(rx) = self.properties_result_rx.as_ref() else {
+            return false;
+        };
+
+        let Ok(summary) = rx.try_recv() else {
+            return false;
+        };
+        self.properties_dialog = Some(summary);
+        self.properties_result_rx = None;
+        true
     }
 
     pub fn start_rename_from_selection(&mut self) {
@@ -1132,6 +1345,152 @@ impl ExplorerState {
     pub fn tree_node(&self, path: &PathBuf) -> Option<&TreeNode> {
         find_tree_node(&self.file_tree, path)
     }
+}
+
+fn unique_path_in_directory(
+    directory: &Path,
+    base_name: &str,
+    extension: Option<&str>,
+) -> Option<PathBuf> {
+    if !directory.is_dir() {
+        return None;
+    }
+
+    for index in 0..10_000u32 {
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!(" ({index})")
+        };
+        let mut name = format!("{base_name}{suffix}");
+        if let Some(ext) = extension {
+            name.push('.');
+            name.push_str(ext);
+        }
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn open_terminal_at_path(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut attempts: Vec<(&str, Vec<&str>)> = vec![
+            ("x-terminal-emulator", vec![]),
+            ("kitty", vec!["--directory"]),
+            ("alacritty", vec!["--working-directory"]),
+            ("wezterm", vec!["start", "--cwd"]),
+            ("konsole", vec!["--workdir"]),
+            ("gnome-terminal", vec!["--working-directory"]),
+            ("xfce4-terminal", vec!["--working-directory"]),
+            ("tilix", vec!["--working-directory"]),
+        ];
+
+        for (command, args) in attempts.drain(..) {
+            let mut cmd = std::process::Command::new(command);
+            if args.is_empty() {
+                cmd.current_dir(path);
+            } else {
+                cmd.args(args).arg(path);
+            }
+            if cmd.spawn().is_ok() {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.display().to_string();
+        return std::process::Command::new("cmd")
+            .args(["/K", "cd", "/d", &path_str])
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(path)
+            .spawn()
+            .is_ok();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn build_properties_loading(paths: &[PathBuf], active_location: &str) -> PropertiesDialog {
+    let item_count = paths.len();
+    let title = if item_count == 1 {
+        paths[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Properties")
+            .to_string()
+    } else {
+        format!("{item_count} items")
+    };
+    let location = if item_count == 1 {
+        paths[0]
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        active_location.to_string()
+    };
+
+    PropertiesDialog {
+        title,
+        location,
+        item_count,
+        file_count: 0,
+        folder_count: 0,
+        size_label: "Calculating…".to_string(),
+        loading: true,
+    }
+}
+
+fn build_properties_summary(paths: Vec<PathBuf>, active_location: String) -> PropertiesDialog {
+    let mut dialog = build_properties_loading(&paths, &active_location);
+
+    let mut file_count = 0usize;
+    let mut folder_count = 0usize;
+    let mut total_bytes = 0u64;
+
+    for path in &paths {
+        if path.is_file() {
+            file_count += 1;
+            total_bytes += path.metadata().map(|meta| meta.len()).unwrap_or(0);
+            continue;
+        }
+        if path.is_dir() {
+            folder_count += 1;
+            for entry in WalkDir::new(path).into_iter().flatten() {
+                if entry.file_type().is_file() {
+                    file_count += 1;
+                    total_bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                } else if entry.file_type().is_dir() {
+                    folder_count += 1;
+                }
+            }
+        }
+    }
+
+    dialog.file_count = file_count;
+    dialog.folder_count = folder_count;
+    dialog.size_label = format_size_kb(total_bytes);
+    dialog.loading = false;
+    dialog
 }
 
 impl Default for ExplorerState {

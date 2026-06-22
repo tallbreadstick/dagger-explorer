@@ -84,7 +84,8 @@ fn show_bottom_sections(
     section_header(ui, "QUICK ACCESS");
     ui.add_space(ITEM_GAP);
     for entry in quick_access {
-        if sidebar_link(ui, &format!("{}  {}", entry.icon, entry.label)).clicked() {
+        let is_active = state.active_path() == entry.path;
+        if sidebar_link(ui, &format!("{}  {}", entry.icon, entry.label), is_active).clicked() {
             state.navigate_active(entry.path.clone());
         }
     }
@@ -94,7 +95,8 @@ fn show_bottom_sections(
     ui.add_space(ITEM_GAP);
     for drive in drives {
         let label = drive_display(drive);
-        if sidebar_link(ui, &format!("💾  {label}")).clicked() {
+        let is_active = state.active_path() == *drive;
+        if sidebar_link(ui, &format!("💾  {label}"), is_active).clicked() {
             state.navigate_active(drive.clone());
         }
     }
@@ -110,24 +112,43 @@ fn section_header(ui: &mut Ui, title: &str) {
     );
 }
 
-fn sidebar_link(ui: &mut Ui, label: &str) -> egui::Response {
+fn sidebar_link(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
     let max_width = ui.available_width();
+    let text_color = if active {
+        theme::text_primary()
+    } else {
+        theme::text_primary()
+    };
     let display = text::ellipsize(
         ui,
         label,
         egui::FontId::proportional(12.0),
-        theme::text_primary(),
+        text_color,
         max_width,
     );
-    ui.add(
+    let response = ui.add(
         egui::Button::new(
             egui::RichText::new(display)
                 .size(12.0)
-                .color(theme::text_primary()),
+                .color(text_color),
         )
         .frame(false)
         .min_size(vec2(max_width, SIDEBAR_ROW_HEIGHT)),
-    )
+    );
+
+    if active || response.hovered() {
+        ui.painter().rect_filled(
+            response.rect,
+            4.0,
+            if active {
+                theme::glass_fill()
+            } else {
+                theme::maximize_hover()
+            },
+        );
+    }
+
+    response
 }
 
 fn drive_display(path: &PathBuf) -> String {

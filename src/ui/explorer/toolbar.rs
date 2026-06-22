@@ -50,7 +50,9 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                         |ui| {
                             ui.spacing_mut().item_spacing.x = GAP;
 
-                            if text_button(ui, "+ New", "New item (coming soon)", true).clicked() {}
+                            if text_button(ui, "+ New File", "Create a new file", true).clicked() {
+                                state.new_file_in_active();
+                            }
 
                             toolbar_divider(ui);
 

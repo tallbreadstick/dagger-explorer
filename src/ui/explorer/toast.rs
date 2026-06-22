@@ -1,4 +1,6 @@
-use eframe::egui::{self, Area, Frame, Id, LayerId, Order, vec2};
+use eframe::egui::{
+    self, Area, Frame, Id, Order, ViewportBuilder, ViewportCommand, ViewportId, vec2,
+};
 
 use crate::explorer::{ConflictChoice, ExplorerState, TransferManager};
 use crate::ui::theme;
@@ -7,9 +9,13 @@ pub fn show(ctx: &egui::Context, state: &mut ExplorerState) {
     show_quick_toast(ctx, state);
 
     if state.transfer.has_conflict() {
-        show_conflict_dialog(ctx, state);
+        show_conflict_window(ctx, state);
     } else if state.transfer.is_active() || state.transfer.progress.error.is_some() {
         show_transfer_toast(ctx, &mut state.transfer);
+    }
+
+    if state.properties_dialog.is_some() {
+        show_properties_window(ctx, state);
     }
 }
 
@@ -190,7 +196,7 @@ fn format_kb_grouped(bytes: u64) -> String {
     out
 }
 
-fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {
+fn show_conflict_window(ctx: &egui::Context, state: &mut ExplorerState) {
     let Some(conflict) = state.transfer.pending_conflict.as_ref() else {
         return;
     };
@@ -204,73 +210,160 @@ fn show_conflict_dialog(ctx: &egui::Context, state: &mut ExplorerState) {
     let source = conflict.source.display().to_string();
     let destination = conflict.destination.display().to_string();
 
-    let screen = ctx.content_rect();
-    let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120);
-    ctx.layer_painter(LayerId::new(Order::Middle, Id::new("conflict_dim")))
-        .rect_filled(screen, 0.0, dim);
+    let viewport_id = ViewportId::from_hash_of("transfer_conflict_window");
+    let builder = ViewportBuilder::default()
+        .with_title("Resolve File Conflict")
+        .with_inner_size(vec2(460.0, 210.0))
+        .with_transparent(false)
+        .with_resizable(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false);
+    ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::Transparent(false));
+        if ui.input(|input| input.viewport().close_requested()) {
+            state.transfer.resolve_conflict(ConflictChoice::Cancel);
+            return;
+        }
 
-    let size = vec2(420.0, 220.0);
-    let pos = screen.center() - size / 2.0;
-
-    Area::new(Id::new("transfer_conflict_dialog"))
-        .order(Order::Foreground)
-        .fixed_pos(pos)
-        .show(ctx, |ui| {
-            Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(16, 18, 26, 245))
-                .stroke(egui::Stroke::new(1.0, theme::glass_stroke()))
-                .inner_margin(16.0)
-                .corner_radius(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(size.x - 32.0);
-
-                    ui.label(
-                        egui::RichText::new("File already exists")
-                            .size(14.0)
-                            .color(theme::text_primary()),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "“{file_name}” already exists in this location."
-                        ))
+        let viewport_rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(viewport_rect, 0.0, theme::title_bar_fill());
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(viewport_rect.shrink2(vec2(14.0, 12.0))),
+            |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new("File already exists")
+                        .size(14.0)
+                        .color(theme::text_primary()),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("“{file_name}” already exists in this location."))
                         .size(12.0)
                         .color(theme::text_muted()),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("From: {source}"))
-                            .size(11.0)
-                            .color(theme::text_muted()),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("To: {destination}"))
-                            .size(11.0)
-                            .color(theme::text_muted()),
-                    );
+                );
+                ui.label(
+                    egui::RichText::new(format!("From: {source}"))
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                );
+                ui.label(
+                    egui::RichText::new(format!("To: {destination}"))
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                );
 
-                    ui.add_space(12.0);
-                    ui.checkbox(
-                        &mut state.transfer.apply_to_all,
-                        egui::RichText::new("Apply to all current items")
-                            .size(12.0)
-                            .color(theme::text_primary()),
-                    );
+                ui.add_space(12.0);
+                ui.checkbox(
+                    &mut state.transfer.apply_to_all,
+                    egui::RichText::new("Apply to all current items")
+                        .size(12.0)
+                        .color(theme::text_primary()),
+                );
 
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Skip").clicked() {
-                            state.transfer.resolve_conflict(ConflictChoice::Skip);
-                        }
-                        if ui.button("Rename").clicked() {
-                            state.transfer.resolve_conflict(ConflictChoice::Rename);
-                        }
-                        if ui.button("Replace").clicked() {
-                            state.transfer.resolve_conflict(ConflictChoice::Replace);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            state.transfer.resolve_conflict(ConflictChoice::Cancel);
-                        }
-                    });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Skip").clicked() {
+                        state.transfer.resolve_conflict(ConflictChoice::Skip);
+                    }
+                    if ui.button("Rename").clicked() {
+                        state.transfer.resolve_conflict(ConflictChoice::Rename);
+                    }
+                    if ui.button("Replace").clicked() {
+                        state.transfer.resolve_conflict(ConflictChoice::Replace);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.transfer.resolve_conflict(ConflictChoice::Cancel);
+                    }
                 });
-        });
+            });
+    });
+}
+
+fn show_properties_window(ctx: &egui::Context, state: &mut ExplorerState) {
+    let Some(properties) = state.properties_dialog.clone() else {
+        return;
+    };
+    let viewport_id = ViewportId::from_hash_of("properties_window");
+    let builder = ViewportBuilder::default()
+        .with_title("Properties")
+        .with_inner_size(vec2(500.0, 208.0))
+        .with_transparent(false)
+        .with_resizable(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false);
+    ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+        ui.ctx()
+            .send_viewport_cmd(ViewportCommand::Transparent(false));
+        if ui.input(|input| input.viewport().close_requested())
+            || ui.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            state.close_properties_dialog();
+            return;
+        }
+
+        let viewport_rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(viewport_rect, 0.0, theme::title_bar_fill());
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(viewport_rect.shrink2(vec2(14.0, 12.0))),
+            |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new("Properties")
+                        .size(14.0)
+                        .color(theme::text_primary()),
+                );
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new(format!("Name: {}", properties.title))
+                        .size(12.0)
+                        .color(theme::text_primary()),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Location: {}", properties.location))
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                );
+                ui.separator();
+                if properties.loading {
+                    ui.label(
+                        egui::RichText::new("Calculating size and item details…")
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                    ui.add_space(6.0);
+                    ui.spinner();
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("Selected items: {}", properties.item_count))
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Files: {}", properties.file_count))
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Folders: {}", properties.folder_count))
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Total size: {}", properties.size_label))
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                }
+
+                ui.add_space(14.0);
+                if ui.button("Close").clicked() {
+                    state.close_properties_dialog();
+                }
+            });
+    });
 }

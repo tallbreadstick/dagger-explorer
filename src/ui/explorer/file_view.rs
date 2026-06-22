@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui::{
     self, Align2, Color32, Frame, Key, LayerId, Order, Rect, Response, ScrollArea, Sense, Shape,
@@ -8,7 +9,6 @@ use eframe::egui::containers::scroll_area::ScrollSource;
 
 use crate::explorer::{
     ExplorerState, FileEntry, SelectionMarquee, ViewMode, multi_select_modifiers, open_path,
-    prepare_entries,
 };
 use crate::ui::{theme, text};
 
@@ -17,6 +17,8 @@ const MARQUEE_PREVIEW_MAX: usize = 150;
 const MAX_ICON_FILL: f32 = 0.75;
 const TILE_LABEL_HEIGHT: f32 = 32.0;
 const LIST_ICON_COLUMN_PADDING: f32 = 16.0;
+const CONTEXT_MENU_WIDTH: f32 = 220.0;
+const CONTEXT_MENU_ROW_HEIGHT: f32 = 24.0;
 
 struct ViewMetrics {
     tile_width: f32,
@@ -188,14 +190,16 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                 enum FileViewBody {
                     Loading,
                     Empty,
-                    Entries(Vec<FileEntry>),
+                    Entries(Arc<Vec<FileEntry>>),
                 }
 
                 let body = if let Some(listing) = state.fs_cache.listing(&path) {
-                    let listing_guard = listing.lock().expect("directory listing lock");
-                    let entries = prepare_entries(&listing_guard.entries, &state.view_options);
-                    let listing_incomplete = !listing_guard.complete;
-                    drop(listing_guard);
+                    let (entries, listing_incomplete) = {
+                        let listing_guard = listing.lock().expect("directory listing lock");
+                        let listing_incomplete = !listing_guard.complete;
+                        let entries = state.prepared_entries_for(&path, &listing_guard.entries);
+                        (entries, listing_incomplete)
+                    };
 
                     if entries.is_empty() && listing_incomplete {
                         FileViewBody::Loading
@@ -268,11 +272,20 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                                     if metrics.list_mode {
                                         list_header(ui, &metrics, width);
                                         ui.add_space(2.0);
-                                        for entry in entries {
+                                        let row_height = metrics.list_row_height.max(1.0);
+                                        let start_y = ui.cursor().top();
+                                        let (min_row, max_row) = visible_row_range(
+                                            ui.clip_rect(),
+                                            start_y,
+                                            row_height,
+                                            entries.len(),
+                                        );
+                                        ui.add_space(min_row as f32 * row_height);
+                                        for row in min_row..max_row {
                                             if let Some(item) = list_row(
                                                 ui,
                                                 state,
-                                                entry,
+                                                &entries[row],
                                                 &metrics,
                                                 show_extensions,
                                                 width,
@@ -280,30 +293,43 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                                                 item_rects.push(item);
                                             }
                                         }
+                                        ui.add_space((entries.len().saturating_sub(max_row) as f32) * row_height);
                                     } else {
                                         let tile_step = metrics.tile_width + 8.0;
                                         let cols =
                                             ((width / tile_step).floor() as usize).max(1);
-
-                                        egui::Grid::new("file_grid")
-                                            .num_columns(cols)
-                                            .spacing(vec2(8.0, 8.0))
-                                            .show(ui, |ui| {
-                                                for (index, entry) in entries.iter().enumerate() {
+                                        let row_height = metrics.tile_height + 8.0;
+                                        let total_rows = entries.len().div_ceil(cols);
+                                        let start_y = ui.cursor().top();
+                                        let (min_row, max_row) = visible_row_range(
+                                            ui.clip_rect(),
+                                            start_y,
+                                            row_height,
+                                            total_rows,
+                                        );
+                                        ui.add_space(min_row as f32 * row_height);
+                                        for row in min_row..max_row {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                for col in 0..cols {
+                                                    let index = row * cols + col;
+                                                    if index >= entries.len() {
+                                                        break;
+                                                    }
                                                     if let Some(item) = icon_tile(
                                                         ui,
                                                         state,
-                                                        entry,
+                                                        &entries[index],
                                                         &metrics,
                                                         show_extensions,
                                                     ) {
                                                         item_rects.push(item);
-                                                    }
-                                                    if (index + 1) % cols == 0 {
-                                                        ui.end_row();
-                                                    }
+                                                }
                                                 }
                                             });
+                                            ui.add_space(8.0);
+                                        }
+                                        ui.add_space((total_rows.saturating_sub(max_row) as f32) * row_height);
                                     }
                                 }
                             }
@@ -317,6 +343,16 @@ pub fn show(ui: &mut Ui, state: &mut ExplorerState) {
                             &item_rects,
                             layout_rect,
                         );
+                        bg_response.context_menu(|ui| {
+                            let pointer_on_item = ui
+                                .ctx()
+                                .input(|input| input.pointer.latest_pos())
+                                .is_some_and(|pos| item_rects.iter().any(|item| item.rect.contains(pos)));
+                            if pointer_on_item {
+                                return;
+                            }
+                            show_background_context_menu(ui, state);
+                        });
                     });
 
                 let clip = state.file_view_bounds.unwrap_or(area);
@@ -344,6 +380,21 @@ fn content_height(
     };
 
     items_h.max(viewport_h)
+}
+
+fn visible_row_range(
+    clip_rect: Rect,
+    rows_start_y: f32,
+    row_height: f32,
+    total_rows: usize,
+) -> (usize, usize) {
+    if total_rows == 0 {
+        return (0, 0);
+    }
+
+    let min_row = ((clip_rect.top() - rows_start_y) / row_height).floor().max(0.0) as usize;
+    let max_row = ((clip_rect.bottom() - rows_start_y) / row_height).ceil().max(0.0) as usize + 1;
+    (min_row.min(total_rows), max_row.min(total_rows).max(min_row.min(total_rows)))
 }
 
 fn handle_marquee(
@@ -599,6 +650,9 @@ fn icon_tile(
     }
 
     handle_item_click(ui, state, &response, path.clone(), is_dir, label);
+    response.context_menu(|ui| {
+        show_selection_context_menu(ui, state);
+    });
 
     Some(ItemRect { path, rect })
 }
@@ -682,6 +736,9 @@ fn list_row(
     );
 
     handle_item_click(ui, state, &response, path.clone(), is_dir, label);
+    response.context_menu(|ui| {
+        show_selection_context_menu(ui, state);
+    });
 
     Some(ItemRect { path, rect })
 }
@@ -838,6 +895,14 @@ fn handle_item_click(
         return;
     }
 
+    if response.secondary_clicked() {
+        state.selection_marquee = None;
+        if !is_selected {
+            state.view_options.select_only(path);
+        }
+        return;
+    }
+
     if response.clicked() && !response.dragged() {
         if state.selection_marquee.is_some() {
             return;
@@ -851,6 +916,74 @@ fn handle_item_click(
         } else {
             state.view_options.select_only(path);
         }
+    }
+}
+
+fn show_background_context_menu(ui: &mut Ui, state: &mut ExplorerState) {
+    ui.set_min_width(CONTEXT_MENU_WIDTH);
+    ui.set_max_width(CONTEXT_MENU_WIDTH);
+
+    context_menu_action(ui, "New File", true, || state.new_file_in_active());
+    context_menu_action(ui, "New Folder", true, || state.new_folder_in_active());
+    ui.separator();
+    context_menu_action(ui, "Open Terminal Here", true, || state.open_terminal_here());
+    if state.can_paste() {
+        context_menu_action(ui, "Paste item(s)", true, || state.paste_clipboard());
+    }
+    ui.separator();
+    context_menu_action(ui, "Properties", true, || {
+        let current = state.active_path();
+        state.show_properties_for_paths(vec![current]);
+    });
+}
+
+fn show_selection_context_menu(ui: &mut Ui, state: &mut ExplorerState) {
+    ui.set_min_width(CONTEXT_MENU_WIDTH);
+    ui.set_max_width(CONTEXT_MENU_WIDTH);
+
+    let has_selection = state.view_options.has_selection();
+    let single_selection = state.view_options.selected.len() == 1;
+    let ctx = ui.ctx().clone();
+
+    context_menu_action(ui, "Open", has_selection, || state.open_selection());
+    context_menu_action(ui, "Open With", has_selection, || state.open_with_selection());
+    ui.separator();
+    context_menu_action(ui, "Cut", has_selection, || state.cut_selection());
+    context_menu_action(ui, "Copy", has_selection, || state.copy_selection());
+    context_menu_action(ui, "Copy as Path", has_selection, || {
+        state.copy_selection_as_paths(&ctx);
+    });
+    context_menu_action(ui, "Rename", single_selection, || {
+        state.start_rename_from_selection();
+    });
+    context_menu_action(ui, "Move to Trash", has_selection, || state.trash_selection());
+    ui.separator();
+    context_menu_action(ui, "Properties", has_selection, || {
+        state.show_properties_for_selection();
+    });
+}
+
+fn context_menu_action<F: FnOnce()>(ui: &mut Ui, label: &str, enabled: bool, action: F) {
+    let response = ui
+        .add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .size(12.0)
+                    .color(theme::text_primary()),
+            )
+            .frame(false)
+            .min_size(vec2(CONTEXT_MENU_WIDTH - 12.0, CONTEXT_MENU_ROW_HEIGHT)),
+        );
+
+    if enabled && response.hovered() {
+        ui.painter()
+            .rect_filled(response.rect, 4.0, theme::maximize_hover());
+    }
+
+    if response.clicked() {
+        action();
+        ui.close();
     }
 }
 

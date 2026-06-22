@@ -116,6 +116,8 @@ enum ListingEvent {
     Complete,
 }
 
+const MAX_LISTING_EVENTS_PER_POLL: usize = 1024;
+
 fn stream_directory(path: &Path, tx: mpsc::Sender<ListingEvent>) {
     for entry in WalkDir::new(path)
         .min_depth(1)
@@ -213,6 +215,7 @@ pub fn open_path(path: &Path) {
 pub struct FsCache {
     listings: std::collections::HashMap<PathBuf, SharedListing>,
     pending: Vec<(PathBuf, Receiver<ListingEvent>)>,
+    revision: u64,
 }
 
 impl FsCache {
@@ -220,6 +223,7 @@ impl FsCache {
         Self {
             listings: std::collections::HashMap::new(),
             pending: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -270,51 +274,92 @@ impl FsCache {
         let path_for_thread = path.clone();
         std::thread::spawn(move || stream_directory(&path_for_thread, tx));
         self.pending.push((path, rx));
+        self.bump_revision();
     }
 
     pub fn invalidate(&mut self, path: &Path) {
-        self.listings.remove(path);
+        let removed_listing = self.listings.remove(path).is_some();
+        let before = self.pending.len();
         self.pending.retain(|(pending, _)| pending != path);
+        if removed_listing || self.pending.len() != before {
+            self.bump_revision();
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        self.pending.retain_mut(|(path, rx)| {
-            loop {
-                match rx.try_recv() {
+        let mut budget = MAX_LISTING_EVENTS_PER_POLL;
+        let mut index = 0usize;
+
+        while index < self.pending.len() {
+            let path = self.pending[index].0.clone();
+            let mut keep_receiver = true;
+
+            while budget > 0 {
+                let event = {
+                    let rx = &self.pending[index].1;
+                    rx.try_recv()
+                };
+
+                match event {
                     Ok(ListingEvent::Entry(entry)) => {
-                        if let Some(listing) = self.listings.get(path) {
+                        if let Some(listing) = self.listings.get(&path) {
                             if let Ok(mut guard) = listing.lock() {
                                 guard.entries.push(entry);
                             }
                         }
                         changed = true;
+                        budget -= 1;
                     }
                     Ok(ListingEvent::Complete) => {
-                        if let Some(listing) = self.listings.get(path) {
+                        if let Some(listing) = self.listings.get(&path) {
                             if let Ok(mut guard) = listing.lock() {
                                 sort_entries(&mut guard.entries);
                                 guard.complete = true;
                             }
                         }
                         changed = true;
-                        return false;
+                        keep_receiver = false;
+                        break;
                     }
-                    Err(mpsc::TryRecvError::Empty) => return true,
+                    Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        if let Some(listing) = self.listings.get(path) {
+                        if let Some(listing) = self.listings.get(&path) {
                             if let Ok(mut guard) = listing.lock() {
                                 sort_entries(&mut guard.entries);
                                 guard.complete = true;
                             }
                         }
                         changed = true;
-                        return false;
+                        keep_receiver = false;
+                        break;
                     }
                 }
             }
-        });
+
+            if keep_receiver {
+                index += 1;
+            } else {
+                self.pending.remove(index);
+            }
+
+            if budget == 0 {
+                break;
+            }
+        }
+
+        if changed {
+            self.bump_revision();
+        }
         changed
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 

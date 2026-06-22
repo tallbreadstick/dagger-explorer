@@ -129,7 +129,7 @@ impl TransferManager {
             active: true,
             counting: true,
             operation,
-            label: "Phase 1/2: Calculating total size…".to_string(),
+            label: "Calculating size…".to_string(),
             total_files: 0,
             done_files: 0,
             total_bytes: 0,
@@ -173,7 +173,7 @@ impl TransferManager {
                     self.progress.total_files = total_files;
                     self.progress.total_bytes = total_bytes;
                     self.progress.counting = false;
-                    self.progress.label = "Phase 2/2: Starting transfer…".to_string();
+                    self.progress.label = "Starting transfer…".to_string();
                 }
                 TransferEvent::Progress {
                     done_files,
