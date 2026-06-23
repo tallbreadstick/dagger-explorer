@@ -21,6 +21,7 @@ pub fn show(ctx: &egui::Context, state: &mut ExplorerState) {
     if state.icon_color_dialog_open {
         show_icon_color_window(ctx, state);
     }
+
 }
 
 fn show_quick_toast(ctx: &egui::Context, state: &mut ExplorerState) {
@@ -408,7 +409,7 @@ fn show_icon_color_window(ctx: &egui::Context, state: &mut ExplorerState) {
                         .size(12.0)
                         .color(theme::text_primary()),
                 );
-                let color = state.selected_icon_color_or_default(theme::text_primary());
+                let color = state.selected_icon_color_or_default(theme::default_icon_color());
                 ui.add_space(8.0);
 
                 ui.label(
@@ -417,7 +418,7 @@ fn show_icon_color_window(ctx: &egui::Context, state: &mut ExplorerState) {
                         .color(theme::text_muted()),
                 );
                 let presets: [(&str, egui::Color32); 12] = [
-                    ("Default", theme::text_primary()),
+                    ("Default", theme::default_icon_color()),
                     ("Blue", egui::Color32::from_rgb(90, 160, 255)),
                     ("Sky", egui::Color32::from_rgb(94, 214, 255)),
                     ("Cyan", egui::Color32::from_rgb(73, 216, 200)),
@@ -472,3 +473,4 @@ fn show_icon_color_window(ctx: &egui::Context, state: &mut ExplorerState) {
         );
     });
 }
+

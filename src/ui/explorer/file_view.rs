@@ -614,7 +614,12 @@ fn icon_tile(
     } else {
         theme::text_primary()
     };
-    let icon_color = state.icon_color_for(&path).unwrap_or(text_color);
+    let icon_default = if selected {
+        theme::selection_text()
+    } else {
+        theme::default_icon_color()
+    };
+    let icon_color = state.icon_color_for(&path).unwrap_or(icon_default);
 
     let (rect, response) = ui.allocate_exact_size(
         vec2(metrics.tile_width, metrics.tile_height),
@@ -680,7 +685,9 @@ fn list_row(
     } else {
         theme::text_primary()
     };
-    let icon_color = state.icon_color_for(&path).unwrap_or(primary);
+    let icon_color = state
+        .icon_color_for(&path)
+        .unwrap_or(theme::default_icon_color());
     let muted = if selected {
         Color32::from_rgba_unmultiplied(230, 235, 245, 200)
     } else {

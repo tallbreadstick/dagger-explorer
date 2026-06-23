@@ -12,6 +12,7 @@ use super::fs::{FsCache, open_path, read_file_entry, sort_cached_entries};
 use super::format::format_size_kb;
 use super::paths::home_dir;
 use super::preferences::{IconColorPreference, Preferences};
+use super::settings::{Keybind, KeybindAction, KeybindSettings, SettingsTab, ShortcutKey, ThemePreset};
 use super::tab::ExplorerTab;
 use super::thumbs::ThumbnailRuntime;
 use super::transfer::{TransferManager, TransferMode};
@@ -111,6 +112,12 @@ pub struct ExplorerState {
     properties_result_rx: Option<Receiver<PropertiesDialog>>,
     icon_colors: HashMap<PathBuf, egui::Color32>,
     pub icon_color_dialog_open: bool,
+    theme_preset: ThemePreset,
+    keybinds: KeybindSettings,
+    pub settings_dialog_open: bool,
+    pub settings_ignore_next_outside_click: bool,
+    pub settings_tab: SettingsTab,
+    pub capturing_keybind_action: Option<KeybindAction>,
     prepared_entries_cache: Option<PreparedEntriesCache>,
     fs_notify_watcher: Option<RecommendedWatcher>,
     fs_notify_rx: Option<Receiver<notify::Result<Event>>>,
@@ -143,13 +150,21 @@ pub struct PropertiesDialog {
 
 impl ExplorerState {
     pub fn new() -> Self {
-        let home = home_dir();
+        Self::new_at_path(home_dir())
+    }
+
+    pub fn with_initial_path(path: PathBuf) -> Self {
+        let initial = if path.is_dir() { path } else { home_dir() };
+        Self::new_at_path(initial)
+    }
+
+    fn new_at_path(initial_path: PathBuf) -> Self {
         let preferences = Preferences::load();
         let mut view_options = FileViewOptions::default();
         preferences.apply_to(&mut view_options);
 
         let mut state = Self {
-            tabs: vec![ExplorerTab::new(0, home.clone())],
+            tabs: vec![ExplorerTab::new(0, initial_path.clone())],
             active_tab: 0,
             next_tab_id: 1,
             fs_cache: FsCache::new(),
@@ -170,12 +185,18 @@ impl ExplorerState {
             properties_result_rx: None,
             icon_colors: load_icon_colors(&preferences),
             icon_color_dialog_open: false,
+            theme_preset: preferences.theme_preset,
+            keybinds: preferences.keybinds.clone(),
+            settings_dialog_open: false,
+            settings_ignore_next_outside_click: false,
+            settings_tab: SettingsTab::Themes,
+            capturing_keybind_action: None,
             prepared_entries_cache: None,
             fs_notify_watcher: None,
             fs_notify_rx: None,
             fs_notify_dir: None,
         };
-        state.fs_cache.request_listing(home);
+        state.fs_cache.request_listing(initial_path);
         state
     }
 
@@ -189,9 +210,61 @@ impl ExplorerState {
                 rgba: [color.r(), color.g(), color.b(), color.a()],
             })
             .collect();
+        preferences.theme_preset = self.theme_preset;
+        preferences.keybinds = self.keybinds.clone();
         if let Err(error) = preferences.save() {
             eprintln!("[dagger-explorer] failed to save preferences: {error}");
         }
+    }
+
+    pub fn theme_preset(&self) -> ThemePreset {
+        self.theme_preset
+    }
+
+    pub fn set_theme_preset(&mut self, theme: ThemePreset) {
+        if self.theme_preset != theme {
+            self.theme_preset = theme;
+            self.save_preferences();
+        }
+    }
+
+    pub fn keybind_for(&self, action: KeybindAction) -> Option<Keybind> {
+        self.keybinds.get(action)
+    }
+
+    pub fn keybind_label(&self, action: KeybindAction) -> String {
+        self.keybind_for(action)
+            .map(Keybind::label)
+            .unwrap_or_else(|| "Unassigned".to_string())
+    }
+
+    pub fn set_keybind(&mut self, action: KeybindAction, binding: Option<Keybind>) {
+        self.keybinds.set(action, binding);
+        self.save_preferences();
+    }
+
+    pub fn reset_keybind_to_default(&mut self, action: KeybindAction) {
+        self.set_keybind(action, action.default_binding());
+    }
+
+    pub fn keybind_is_default(&self, action: KeybindAction) -> bool {
+        self.keybinds.is_default_binding(action)
+    }
+
+    pub fn toggle_settings_dialog(&mut self) {
+        self.settings_dialog_open = !self.settings_dialog_open;
+        if self.settings_dialog_open {
+            self.settings_ignore_next_outside_click = true;
+        } else {
+            self.settings_ignore_next_outside_click = false;
+            self.capturing_keybind_action = None;
+        }
+    }
+
+    pub fn close_settings_dialog(&mut self) {
+        self.settings_dialog_open = false;
+        self.settings_ignore_next_outside_click = false;
+        self.capturing_keybind_action = None;
     }
 
     pub fn active_tab(&self) -> &ExplorerTab {
@@ -812,7 +885,10 @@ impl ExplorerState {
     }
 
     pub fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.view_options.renaming.is_some() || self.path_bar_edit.is_some() {
+        if self.view_options.renaming.is_some()
+            || self.path_bar_edit.is_some()
+            || self.settings_dialog_open
+        {
             return;
         }
 
@@ -920,6 +996,13 @@ impl ExplorerState {
             Cut,
             Paste,
             Rename,
+            NewFile,
+            ToggleSettings,
+            GoBack,
+            GoForward,
+            GoUp,
+            Refresh,
+            SelectAll,
             Trash,
             DeletePermanent,
         }
@@ -932,37 +1015,54 @@ impl ExplorerState {
         // clipboards produce no event on press — we fall back to Key::V release below.
         ctx.input_mut(|input| {
             if action.is_none() {
-                let copy = KeyboardShortcut::new(Modifiers::COMMAND, Key::C);
-                let cut = KeyboardShortcut::new(Modifiers::COMMAND, Key::X);
-                let paste = KeyboardShortcut::new(Modifiers::COMMAND, Key::V);
-
-                if input.consume_shortcut(&copy) {
+                if self.keybinds.consume_action(input, KeybindAction::Copy) {
                     action = Some(Action::Copy);
-                } else if input.consume_shortcut(&cut) {
+                } else if self.keybinds.consume_action(input, KeybindAction::Cut) {
                     action = Some(Action::Cut);
-                } else if input.consume_shortcut(&paste) {
+                } else if self.keybinds.consume_action(input, KeybindAction::Paste) {
                     action = Some(Action::Paste);
                     saw_paste_event = true;
+                } else if self.keybinds.consume_action(input, KeybindAction::Rename) {
+                    action = Some(Action::Rename);
+                } else if self.keybinds.consume_action(input, KeybindAction::NewFile) {
+                    action = Some(Action::NewFile);
+                } else if self
+                    .keybinds
+                    .consume_action(input, KeybindAction::OpenSettings)
+                {
+                    action = Some(Action::ToggleSettings);
+                } else if self.keybinds.consume_action(input, KeybindAction::GoBack) {
+                    action = Some(Action::GoBack);
+                } else if self.keybinds.consume_action(input, KeybindAction::GoForward) {
+                    action = Some(Action::GoForward);
+                } else if self.keybinds.consume_action(input, KeybindAction::UpOneLevel) {
+                    action = Some(Action::GoUp);
+                } else if self.keybinds.consume_action(input, KeybindAction::Refresh) {
+                    action = Some(Action::Refresh);
+                } else if self.keybinds.consume_action(input, KeybindAction::SelectAll) {
+                    action = Some(Action::SelectAll);
                 }
             }
 
             input.events.retain(|event| {
                 match event {
                     Event::Copy => {
-                        if action.is_none() {
+                        if action.is_none() && self.keybinds.is_default_binding(KeybindAction::Copy) {
                             action = Some(Action::Copy);
                         }
                         false
                     }
                     Event::Cut => {
-                        if action.is_none() {
+                        if action.is_none() && self.keybinds.is_default_binding(KeybindAction::Cut) {
                             action = Some(Action::Cut);
                         }
                         false
                     }
                     Event::Paste(_) => {
                         saw_paste_event = true;
-                        if action.is_none() {
+                        if action.is_none()
+                            && self.keybinds.is_default_binding(KeybindAction::Paste)
+                        {
                             action = Some(Action::Paste);
                         }
                         false
@@ -971,7 +1071,11 @@ impl ExplorerState {
                 }
             });
 
-            if action.is_none() && !saw_paste_event {
+            if action.is_none()
+                && !saw_paste_event
+                && self.keybinds.get(KeybindAction::Paste)
+                    == Some(Keybind::command(ShortcutKey::V))
+            {
                 input.events.retain(|event| {
                     if let Event::Key {
                         key: Key::V,
@@ -990,7 +1094,6 @@ impl ExplorerState {
             }
 
             if action.is_none() {
-                let rename = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
                 let trash = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
                 let delete_permanent = KeyboardShortcut::new(Modifiers::SHIFT, Key::Delete);
 
@@ -998,8 +1101,6 @@ impl ExplorerState {
                     action = Some(Action::DeletePermanent);
                 } else if input.consume_shortcut(&trash) {
                     action = Some(Action::Trash);
-                } else if input.consume_shortcut(&rename) {
-                    action = Some(Action::Rename);
                 }
             }
         });
@@ -1011,12 +1112,31 @@ impl ExplorerState {
             Some(Action::Rename) if self.view_options.selected.len() == 1 => {
                 self.start_rename_from_selection();
             }
+            Some(Action::NewFile) => self.new_file_in_active(),
+            Some(Action::ToggleSettings) => self.toggle_settings_dialog(),
+            Some(Action::GoBack) => self.go_back(),
+            Some(Action::GoForward) => self.go_forward(),
+            Some(Action::GoUp) => self.go_up(),
+            Some(Action::Refresh) => self.refresh_active(),
+            Some(Action::SelectAll) => self.select_all_active(),
             Some(Action::Trash) if self.view_options.has_selection() => self.trash_selection(),
             Some(Action::DeletePermanent) if self.view_options.has_selection() => {
                 self.delete_selection_permanently();
             }
             _ => {}
         }
+    }
+
+    pub fn select_all_active(&mut self) {
+        let Some(entries) = self.visible_directory_entries() else {
+            return;
+        };
+        self.view_options.set_selection(
+            entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// Move the sole selected item with arrow keys. Returns true if selection changed.

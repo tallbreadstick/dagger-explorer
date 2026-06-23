@@ -5,6 +5,7 @@ mod format;
 mod fs;
 mod paths;
 mod preferences;
+mod settings;
 mod state;
 mod tab;
 mod thumbs;
@@ -18,6 +19,9 @@ pub use fs::{FileEntry, open_path};
 pub use paths::{
     apply_path_completion, list_directory_completions, list_drives, path_completion_context,
     path_components, quick_access_entries, QuickAccessEntry,
+};
+pub use settings::{
+    Keybind, KeybindAction, SettingsTab, ShortcutKey, ThemePreset,
 };
 pub use state::{ExplorerState, SelectionMarquee};
 pub use transfer::{ConflictChoice, TransferManager};

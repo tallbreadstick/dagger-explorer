@@ -7,7 +7,12 @@ use super::{theme, title_bar};
 
 const RESIZE_GRIP: f32 = 6.0;
 
-pub fn show(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
+pub fn show_with_title_center(
+    ui: &mut Ui,
+    title: &str,
+    add_title_center: impl FnOnce(&mut Ui),
+    add_contents: impl FnOnce(&mut Ui),
+) {
     let panel_frame = egui::Frame::new()
         .fill(theme::glass_fill())
         .corner_radius(CornerRadius::same(10))
@@ -21,7 +26,7 @@ pub fn show(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         // Register edge grips before the title bar so window controls stay clickable.
         resize_edges(ui, app_rect);
 
-        let title_bar_rect = title_bar::show(ui, title);
+        let title_bar_rect = title_bar::show(ui, title, add_title_center);
 
         let content_rect = {
             let mut rect = app_rect;

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::paths::preferences_path;
+use super::settings::{KeybindSettings, ThemePreset};
 use super::view::{FileViewOptions, ViewMode};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,6 +18,10 @@ pub struct Preferences {
     pub show_file_extensions: bool,
     #[serde(default)]
     pub icon_colors: Vec<IconColorPreference>,
+    #[serde(default)]
+    pub theme_preset: ThemePreset,
+    #[serde(default)]
+    pub keybinds: KeybindSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +41,8 @@ impl Default for Preferences {
             show_hidden_files: false,
             show_file_extensions: true,
             icon_colors: Vec::new(),
+            theme_preset: ThemePreset::default(),
+            keybinds: KeybindSettings::default(),
         }
     }
 }
@@ -70,6 +77,8 @@ impl Preferences {
             show_hidden_files: options.show_hidden_files,
             show_file_extensions: options.show_file_extensions,
             icon_colors: Vec::new(),
+            theme_preset: ThemePreset::default(),
+            keybinds: KeybindSettings::default(),
         }
     }
 }

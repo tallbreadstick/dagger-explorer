@@ -1,5 +1,6 @@
 use eframe::egui::{
-    self, Align2, Color32, FontId, Id, PointerButton, Rect, Sense, Ui, ViewportCommand, vec2,
+    self, Align2, Color32, FontId, Id, PointerButton, Rect, Sense, Ui, UiBuilder, ViewportCommand,
+    vec2,
 };
 
 use super::theme;
@@ -8,7 +9,7 @@ const TITLE_BAR_HEIGHT: f32 = 36.0;
 const CONTROL_WIDTH: f32 = 46.0;
 const CONTROL_COUNT: f32 = 3.0;
 
-pub fn show(ui: &mut Ui, title: &str) -> Rect {
+pub fn show(ui: &mut Ui, title: &str, add_title_center: impl FnOnce(&mut Ui)) -> Rect {
     let title_bar_rect = {
         let mut rect = ui.max_rect();
         rect.max.y = rect.min.y + TITLE_BAR_HEIGHT;
@@ -53,6 +54,18 @@ pub fn show(ui: &mut Ui, title: &str) -> Rect {
     if drag_response.drag_started_by(PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
+
+    let center_size = vec2(360.0, (TITLE_BAR_HEIGHT - 8.0).max(1.0));
+    let center_rect = Rect::from_center_size(drag_rect.center(), center_size)
+        .intersect(drag_rect.shrink2(vec2(12.0, 4.0)));
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(center_rect)
+            .layout(egui::Layout::centered_and_justified(
+                egui::Direction::LeftToRight,
+            )),
+        |ui| add_title_center(ui),
+    );
 
     window_controls(ui, controls_rect);
 
