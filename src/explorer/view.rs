@@ -40,6 +40,8 @@ pub enum ClipboardMode {
 pub struct RenameState {
     pub path: PathBuf,
     pub text: String,
+    pub select_all_on_focus: bool,
+    pub cancel_removes_target: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,7 +105,21 @@ impl FileViewOptions {
     }
 
     pub fn start_rename(&mut self, path: PathBuf, text: String) {
-        self.renaming = Some(RenameState { path, text });
+        self.renaming = Some(RenameState {
+            path,
+            text,
+            select_all_on_focus: true,
+            cancel_removes_target: false,
+        });
+    }
+
+    pub fn start_rename_select_all(&mut self, path: PathBuf, text: String) {
+        self.renaming = Some(RenameState {
+            path,
+            text,
+            select_all_on_focus: true,
+            cancel_removes_target: true,
+        });
     }
 
     pub fn add_to_selection(&mut self, path: PathBuf) {

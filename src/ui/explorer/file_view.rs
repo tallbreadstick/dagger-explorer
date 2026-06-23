@@ -531,7 +531,7 @@ fn handle_rename_input(ui: &mut Ui, state: &mut ExplorerState) {
     }
 
     if ui.input(|input| input.key_pressed(Key::Escape)) {
-        state.view_options.cancel_rename();
+        state.cancel_active_rename();
         return;
     }
 
@@ -856,6 +856,8 @@ fn show_rename_field(
     rect: Rect,
     align: Align2,
 ) {
+    use egui::text::{CCursor, CCursorRange};
+
     let Some(rename) = state.view_options.renaming.as_mut() else {
         return;
     };
@@ -880,6 +882,19 @@ fn show_rename_field(
             .margin(egui::Margin::ZERO),
     );
     response.request_focus();
+
+    if rename.select_all_on_focus {
+        let id = ui.id().with("rename").with(path);
+        if let Some(mut text_state) = egui::TextEdit::load_state(ui.ctx(), id) {
+            let end = CCursor::new(rename.text.chars().count());
+            text_state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(0),
+                end,
+            )));
+            egui::TextEdit::store_state(ui.ctx(), id, text_state);
+        }
+        rename.select_all_on_focus = false;
+    }
 }
 
 fn handle_item_click(

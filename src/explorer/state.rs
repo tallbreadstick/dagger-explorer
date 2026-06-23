@@ -672,7 +672,7 @@ impl ExplorerState {
             .unwrap_or("New File")
             .to_string();
         self.view_options.select_only(path.clone());
-        self.view_options.start_rename(path, name);
+        self.view_options.start_rename_select_all(path, name);
     }
 
     pub fn new_folder_in_active(&mut self) {
@@ -1371,6 +1371,32 @@ impl ExplorerState {
         }
 
         true
+    }
+
+    pub fn cancel_active_rename(&mut self) {
+        let Some(rename) = self.view_options.renaming.take() else {
+            return;
+        };
+        if !rename.cancel_removes_target {
+            return;
+        }
+
+        let Some(parent) = rename.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&rename.path);
+        self.fs_cache.invalidate(&parent);
+        self.fs_cache.request_listing(parent.clone());
+        self.thumbnails.on_directory_changing();
+
+        if self
+            .view_options
+            .selected
+            .iter()
+            .any(|selected| *selected == rename.path)
+        {
+            self.view_options.clear_selection();
+        }
     }
 
     pub fn go_back(&mut self) {
