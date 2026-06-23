@@ -8,7 +8,7 @@ use jwalk::WalkDir;
 
 use super::delete::{delete_paths_permanently, move_paths_to_trash};
 use super::directory_loading::DirectoryLoadingBar;
-use super::fs::{FsCache, open_path, read_file_entry, sort_cached_entries};
+use super::fs::{FsCache, open_path};
 use super::format::format_size_kb;
 use super::paths::home_dir;
 use super::preferences::{IconColorPreference, Preferences};
@@ -21,7 +21,7 @@ use super::view::{
     selection_neighbor_index,
 };
 use super::{get_system_clipboard, has_file_clipboard, set_system_clipboard, ClipboardOp, ClipboardMode};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug)]
 pub struct TreeNode {
@@ -122,6 +122,8 @@ pub struct ExplorerState {
     fs_notify_watcher: Option<RecommendedWatcher>,
     fs_notify_rx: Option<Receiver<notify::Result<Event>>>,
     fs_notify_dir: Option<PathBuf>,
+    fs_notify_refresh_due_at: Option<f64>,
+    fs_notify_last_refresh_at: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +197,8 @@ impl ExplorerState {
             fs_notify_watcher: None,
             fs_notify_rx: None,
             fs_notify_dir: None,
+            fs_notify_refresh_due_at: None,
+            fs_notify_last_refresh_at: f64::NEG_INFINITY,
         };
         state.fs_cache.request_listing(initial_path);
         state
@@ -287,8 +291,14 @@ impl ExplorerState {
             ctx.request_repaint();
         }
 
-        if self.poll_fs_notify_events(&active_path) {
+        let now = ctx.input(|input| input.time);
+        if self.poll_fs_notify_events(&active_path, now) {
             ctx.request_repaint();
+        }
+        if let Some(due_at) = self.fs_notify_refresh_due_at {
+            if due_at > now {
+                ctx.request_repaint_after(Duration::from_secs_f64(due_at - now));
+            }
         }
 
         self.schedule_directory_thumbnails(&active_path);
@@ -397,59 +407,69 @@ impl ExplorerState {
         self.fs_notify_watcher = Some(watcher);
         self.fs_notify_rx = Some(rx);
         self.fs_notify_dir = Some(active_path.to_path_buf());
+        self.fs_notify_refresh_due_at = None;
+        self.fs_notify_last_refresh_at = f64::NEG_INFINITY;
     }
 
-    fn poll_fs_notify_events(&mut self, active_path: &Path) -> bool {
+    fn poll_fs_notify_events(&mut self, active_path: &Path, now: f64) -> bool {
         let Some(rx) = self.fs_notify_rx.as_ref() else {
             return false;
         };
 
-        let mut changed_paths = HashSet::new();
+        let mut active_dir_changed = false;
         while let Ok(event_result) = rx.try_recv() {
             if let Ok(event) = event_result {
+                // Ignore non-mutating access noise to avoid refresh loops.
+                if matches!(event.kind, EventKind::Access(_)) {
+                    continue;
+                }
+                if event.paths.is_empty() {
+                    active_dir_changed = true;
+                    continue;
+                }
                 for path in event.paths {
-                    if path.parent().is_some_and(|parent| parent == active_path) {
-                        changed_paths.insert(path);
+                    if path == active_path
+                        || path.parent().is_some_and(|parent| parent == active_path)
+                    {
+                        active_dir_changed = true;
+                        break;
                     }
                 }
             }
         }
 
-        if changed_paths.is_empty() {
-            return false;
+        if active_dir_changed {
+            // Coalesce bursts of filesystem events (common for external managers).
+            self.fs_notify_refresh_due_at = Some(now + 0.20);
         }
 
-        let Some(listing) = self.fs_cache.listing(active_path) else {
+        let Some(due_at) = self.fs_notify_refresh_due_at else {
             return false;
         };
-        let Ok(mut guard) = listing.lock() else {
+        if now < due_at {
             return false;
-        };
-        if !guard.complete {
+        }
+        if self.fs_cache.is_listing_loading(active_path) {
+            // Never restart listing while still loading; retry shortly.
+            self.fs_notify_refresh_due_at = Some(now + 0.20);
+            return false;
+        }
+        // Bound watcher-triggered refresh rate to avoid jitter on noisy backends.
+        const MIN_NOTIFY_REFRESH_INTERVAL: f64 = 0.75;
+        let next_allowed = self.fs_notify_last_refresh_at + MIN_NOTIFY_REFRESH_INTERVAL;
+        if now < next_allowed {
+            self.fs_notify_refresh_due_at = Some(next_allowed);
             return false;
         }
 
-        let mut any_change = false;
-        for path in changed_paths {
-            if path.exists() {
-                if let Some(new_entry) = read_file_entry(&path) {
-                    if let Some(index) = guard.entries.iter().position(|entry| entry.path == path) {
-                        guard.entries[index] = new_entry;
-                    } else {
-                        guard.entries.push(new_entry);
-                    }
-                    any_change = true;
-                }
-            } else if let Some(index) = guard.entries.iter().position(|entry| entry.path == path) {
-                guard.entries.remove(index);
-                any_change = true;
-            }
-        }
-
-        if any_change {
-            sort_cached_entries(&mut guard.entries);
-        }
-        any_change
+        // Re-request listing on any relevant fs event so cache + prepared view revision
+        // stay consistent for create/delete/rename/modify changes from any source.
+        self.fs_cache.invalidate(active_path);
+        self.fs_cache.request_listing(active_path.to_path_buf());
+        self.thumbnails.on_directory_changing();
+        self.fs_notify_refresh_due_at = None;
+        self.fs_notify_last_refresh_at = now;
+        true
     }
 
     fn is_directory_loading(&self, path: &Path) -> bool {
