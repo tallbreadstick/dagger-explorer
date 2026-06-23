@@ -288,6 +288,18 @@ fn theme_swatches(preset: ThemePreset) -> [egui::Color32; 4] {
             egui::Color32::from_rgb(71, 140, 230),
             egui::Color32::from_rgb(10, 10, 10),
         ],
+        ThemePreset::Smoky => [
+            egui::Color32::from_rgb(36, 36, 38),
+            egui::Color32::from_rgb(28, 28, 32),
+            egui::Color32::from_rgb(68, 78, 98),
+            egui::Color32::from_rgb(255, 255, 255),
+        ],
+        ThemePreset::Baltic => [
+            egui::Color32::from_rgb(241, 238, 232),
+            egui::Color32::from_rgb(233, 228, 220),
+            egui::Color32::from_rgb(178, 132, 94),
+            egui::Color32::from_rgb(58, 44, 34),
+        ],
         ThemePreset::Nebula => [
             egui::Color32::from_rgb(36, 26, 56),
             egui::Color32::from_rgb(30, 21, 48),

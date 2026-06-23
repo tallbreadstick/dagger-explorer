@@ -7,6 +7,9 @@ pub enum ThemePreset {
     #[default]
     GlassSquid,
     Glacier,
+    #[serde(alias = "smoke")]
+    Smoky,
+    Baltic,
     Nebula,
     Prismarine,
     Aurora,
@@ -14,9 +17,11 @@ pub enum ThemePreset {
 }
 
 impl ThemePreset {
-    pub const ALL: [ThemePreset; 6] = [
+    pub const ALL: [ThemePreset; 8] = [
         ThemePreset::GlassSquid,
         ThemePreset::Glacier,
+        ThemePreset::Smoky,
+        ThemePreset::Baltic,
         ThemePreset::Nebula,
         ThemePreset::Prismarine,
         ThemePreset::Aurora,
@@ -27,6 +32,8 @@ impl ThemePreset {
         match self {
             ThemePreset::GlassSquid => "Glass Squid",
             ThemePreset::Glacier => "Glacier",
+            ThemePreset::Smoky => "Smoky",
+            ThemePreset::Baltic => "Baltic",
             ThemePreset::Nebula => "Nebula",
             ThemePreset::Prismarine => "Prismarine",
             ThemePreset::Aurora => "Aurora",
